@@ -129,6 +129,18 @@ export interface DimensionResult {
   gaps: Array<{ check: Check; finding: Finding }>;
 }
 
+// ─── Gamification ─────────────────────────────────────────────────────────────
+
+/** An achievement earned by this scan (or previously and still held). */
+export interface EarnedAchievement {
+  id: string;
+  name: string;
+  icon: string;
+  description: string;
+  /** True if earned for the first time in this scan. */
+  isNew: boolean;
+}
+
 export interface ScanReport {
   projectRoot: string;
   stacks: Stack[];
@@ -144,6 +156,8 @@ export interface ScanReport {
   durationMs: number;
   /** Populated when a .racoon-baseline.json exists from a previous scan. */
   delta?: ScanDelta;
+  /** Achievements earned by this scan. */
+  achievements?: EarnedAchievement[];
 }
 
 // ─── Baseline & delta ─────────────────────────────────────────────────────────
@@ -169,6 +183,10 @@ export interface BaselineData {
   overallCeiling: number;
   dimensions: BaselineDimensionEntry[];
   checks: BaselineCheckEntry[];
+  /** IDs of all achievements earned up to and including this scan. */
+  earnedAchievements?: string[];
+  /** Number of consecutive scans where the overall score improved. */
+  consecutiveImprovements?: number;
 }
 
 /** Per-check change between the current scan and the stored baseline. */

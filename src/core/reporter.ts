@@ -13,20 +13,46 @@ export function report(scanReport: ScanReport, format: OutputFormat): void {
   }
 }
 
-// ─── JSON output ─────────────────────────────────────────────────────────────
+// ─── Tier system ──────────────────────────────────────────────────────────────
+
+const TIERS = [
+  { label: 'S', min: 90, name: 'Exceptional',    color: chalk.bold.yellow    },
+  { label: 'A', min: 80, name: 'Strong',          color: chalk.bold.green     },
+  { label: 'B', min: 70, name: 'Solid',           color: chalk.green          },
+  { label: 'C', min: 60, name: 'Developing',      color: chalk.yellow         },
+  { label: 'D', min: 40, name: 'Needs Attention', color: chalk.hex('#FFA500') },
+  { label: 'E', min: 0,  name: 'Critical',        color: chalk.red            },
+] as const;
+
+type Tier = typeof TIERS[number];
+
+function getTier(score: number): Tier {
+  return TIERS.find((t) => score >= t.min) ?? TIERS[TIERS.length - 1];
+}
+
+function nextTier(tier: Tier): Tier | null {
+  const idx = TIERS.indexOf(tier);
+  return idx > 0 ? TIERS[idx - 1] : null;
+}
+
+// ─── JSON output ──────────────────────────────────────────────────────────────
 
 function reportJson(r: ScanReport): void {
+  const tier = getTier(r.overallScore);
   const output = {
     projectRoot: r.projectRoot,
     stacks: r.stacks,
     overallScore: r.overallScore,
     overallCeiling: r.overallCeiling,
+    tier: { label: tier.label, name: tier.name },
     durationMs: r.durationMs,
+    achievements: r.achievements ?? [],
     dimensions: r.dimensions.map((d) => ({
       dimension: d.dimension,
       label: dimensionLabel(d.dimension),
       score: d.score,
       ceiling: d.ceiling,
+      tier: { label: getTier(d.score).label, name: getTier(d.score).name },
       gaps: d.gaps.map(({ check, finding }) => ({
         checkId: check.id,
         checkName: check.name,
@@ -78,11 +104,10 @@ function reportTerminal(r: ScanReport): void {
       chalk.bold('Ceiling'),
       chalk.bold('Status'),
     ],
-    colWidths: [22, 10, 10, 26],
+    colWidths: [22, 14, 10, 22],
     style: { head: [], border: ['gray'] },
   });
 
-  // Sort by dimension order defined in DIMENSIONS
   const orderedDimensions = DIMENSIONS.map((meta) =>
     r.dimensions.find((d) => d.dimension === meta.dimension),
   ).filter((d): d is DimensionResult => d !== undefined);
@@ -98,7 +123,7 @@ function reportTerminal(r: ScanReport): void {
 
   console.log(table.toString());
 
-  // Overall score bar
+  // Overall score bar + tier
   console.log('');
   console.log(overallBar(r.overallScore, r.overallCeiling));
   console.log('');
@@ -107,9 +132,8 @@ function reportTerminal(r: ScanReport): void {
   if (r.strengths.length > 0) {
     console.log(chalk.bold.green('  What lifts your score'));
     for (const { finding, dimension } of r.strengths) {
-      const label = dimensionLabel(dimension);
       console.log(
-        `  ${chalk.green('▲')} ${chalk.gray(`[${label}]`)} ${finding.message}`,
+        `  ${chalk.green('▲')} ${chalk.gray(`[${dimensionLabel(dimension)}]`)} ${finding.message}`,
       );
     }
     console.log('');
@@ -119,19 +143,17 @@ function reportTerminal(r: ScanReport): void {
   if (r.weaknesses.length > 0) {
     console.log(chalk.bold.yellow('  Documented gaps — what holds you back'));
     for (const { finding, dimension } of r.weaknesses) {
-      const label = dimensionLabel(dimension);
       const gap = finding.maxScore - finding.score;
       const icon = finding.severity === 'critical' ? chalk.red('✖') : chalk.yellow('▼');
       console.log(
-        `  ${icon} ${chalk.gray(`[${label}]`)} ${finding.message} ${chalk.gray(`(−${gap} pts)`)}`,
+        `  ${icon} ${chalk.gray(`[${dimensionLabel(dimension)}]`)} ${finding.message} ${chalk.gray(`(−${gap} pts)`)}`,
       );
       if (finding.evidence && finding.evidence.length > 0) {
         const shown = finding.evidence.slice(0, 5);
         for (const e of shown) {
           const loc = chalk.cyan(`${e.file}:${e.line}`);
           const labelTag = e.label ? chalk.magenta(`[${e.label}]`) + '  ' : '';
-          const weight = e.weight ?? 1;
-          const dim = weight < 1; // visually de-emphasise reduced-weight items
+          const dim = (e.weight ?? 1) < 1;
           const code = dim ? chalk.gray(e.snippet) : chalk.white(e.snippet);
           console.log(`     ${chalk.gray('↳')} ${loc}  ${labelTag}${code}`);
         }
@@ -148,7 +170,7 @@ function reportTerminal(r: ScanReport): void {
     console.log('');
   }
 
-  // Exit hint
+  // Ceiling hint
   const gap = r.overallCeiling - r.overallScore;
   if (gap > 0) {
     console.log(
@@ -156,6 +178,31 @@ function reportTerminal(r: ScanReport): void {
         `  Closing identified gaps could raise your score by up to ${chalk.white(`+${gap} pts`)} → ${chalk.white(`${r.overallCeiling}/100`)}`,
       ),
     );
+    console.log('');
+  }
+
+  // Achievements
+  if (r.achievements && r.achievements.length > 0) {
+    console.log(hr);
+    console.log('');
+    const newOnes = r.achievements.filter((a) => a.isNew);
+    const held    = r.achievements.filter((a) => !a.isNew);
+
+    console.log(
+      `  ${chalk.bold('Achievements')}  ${chalk.gray(`(${r.achievements.length} earned)`)}`,
+    );
+    console.log('');
+
+    for (const a of newOnes) {
+      console.log(
+        `  ${chalk.bold.yellow('★')} ${chalk.bold.yellow(a.name.padEnd(24))} ${a.icon}  ${chalk.white(a.description)}  ${chalk.bold.yellow('← new!')}`,
+      );
+    }
+    for (const a of held) {
+      console.log(
+        `  ${chalk.gray('·')} ${chalk.white(a.name.padEnd(24))} ${a.icon}  ${chalk.gray(a.description)}`,
+      );
+    }
     console.log('');
   }
 
@@ -172,12 +219,8 @@ function reportTerminal(r: ScanReport): void {
         ? chalk.red(`▼ ${d.scoreDelta} pts`)
         : chalk.gray('no change');
 
-    console.log(
-      `  ${chalk.bold('Changes since last scan')}  ${chalk.gray(`(${ts})`)}`,
-    );
-    console.log(
-      `  Overall: ${chalk.white(`${d.previousScore}`)} → ${chalk.white(`${r.overallScore}`)}  ${scoreArrow}`,
-    );
+    console.log(`  ${chalk.bold('Changes since last scan')}  ${chalk.gray(`(${ts})`)}`);
+    console.log(`  Overall: ${chalk.white(`${d.previousScore}`)} → ${chalk.white(`${r.overallScore}`)}  ${scoreArrow}`);
     console.log('');
 
     if (d.regressions.length > 0) {
@@ -217,54 +260,39 @@ function reportTerminal(r: ScanReport): void {
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function scoreCell(score: number): string {
-  const formatted = `${score}/100`;
-  if (score >= 80) return chalk.green(formatted);
-  if (score >= 60) return chalk.yellow(formatted);
-  if (score >= 40) return chalk.hex('#FFA500')(formatted);
-  return chalk.red(formatted);
+  const tier = getTier(score);
+  return `${tier.color(`${score}/100`)}  ${chalk.dim(tier.color(`[${tier.label}]`))}`;
 }
 
 function statusCell(dr: DimensionResult): string {
-  const gapCount = dr.gaps.length;
-  const hasCritical = dr.gaps.some(
-    (g) => g.finding.severity === 'critical',
-  );
+  const gapCount  = dr.gaps.length;
+  const hasCritical = dr.gaps.some((g) => g.finding.severity === 'critical');
 
   if (dr.score >= 80 && gapCount === 0) return chalk.green('✓ Strong');
   if (dr.score >= 80) return chalk.green(`▲ Lifts score`);
-  if (hasCritical) return chalk.red(`✖ Critical gaps (${gapCount})`);
-  if (dr.score < 40) return chalk.red(`▼ Holds back (${gapCount} gaps)`);
+  if (hasCritical)    return chalk.red(`✖ Critical gaps (${gapCount})`);
+  if (dr.score < 40)  return chalk.red(`▼ Holds back (${gapCount} gaps)`);
   return chalk.yellow(`△ Improvable (${gapCount} gaps)`);
 }
 
 function overallBar(score: number, ceiling: number): string {
-  const barWidth = 40;
-  const filled = Math.round((score / 100) * barWidth);
+  const barWidth  = 40;
+  const filled    = Math.round((score / 100) * barWidth);
   const ceilingPos = Math.round((ceiling / 100) * barWidth);
 
   const bar = Array.from({ length: barWidth }, (_, i) => {
-    if (i < filled) return chalk.green('█');
+    if (i < filled)       return chalk.green('█');
     if (i === ceilingPos) return chalk.gray('◆');
     return chalk.gray('░');
   }).join('');
 
-  const grade = scoreGrade(score);
-  const scoreStr = score >= 60
-    ? chalk.green.bold(`${score}/100`)
-    : score >= 40
-    ? chalk.yellow.bold(`${score}/100`)
-    : chalk.red.bold(`${score}/100`);
+  const tier     = getTier(score);
+  const next     = nextTier(tier);
+  const scoreStr = tier.color.bold(`${score}/100`);
+  const tierStr  = tier.color(`${tier.label}  ${tier.name}`);
+  const nextHint = next
+    ? chalk.gray(`  ·  ${next.min - score} pts to ${chalk.white(next.label)}`)
+    : chalk.gray('  ·  peak tier');
 
-  return (
-    `  ${bar}  ${scoreStr}  ${chalk.gray(`ceiling: ${ceiling}/100`)}  ${grade}`
-  );
-}
-
-function scoreGrade(score: number): string {
-  if (score >= 90) return chalk.green.bold('A');
-  if (score >= 80) return chalk.green('B');
-  if (score >= 70) return chalk.yellow('C');
-  if (score >= 60) return chalk.yellow('D');
-  if (score >= 40) return chalk.hex('#FFA500')('E');
-  return chalk.red('F');
+  return `  ${bar}  ${scoreStr}  ${tierStr}${nextHint}`;
 }

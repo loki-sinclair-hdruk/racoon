@@ -7,6 +7,7 @@ import { detectStacks } from './detector.js';
 import { ScoringEngine } from './scorer.js';
 import { ScanReport } from './types.js';
 import { loadBaseline, saveBaseline, computeDelta } from './baseline.js';
+import { computeAchievements } from './achievements.js';
 
 export interface ScanOptions {
   projectRoot: string;
@@ -69,7 +70,15 @@ export class Scanner {
     if (baseline) {
       report.delta = computeDelta(report, baseline);
     }
-    saveBaseline(absRoot, report);
+
+    // 7. Achievements + consecutive improvement streak
+    const consecutiveImprovements =
+      report.delta && report.delta.scoreDelta > 0
+        ? (baseline?.consecutiveImprovements ?? 0) + 1
+        : 0;
+    report.achievements = computeAchievements(report, baseline, consecutiveImprovements);
+
+    saveBaseline(absRoot, report, consecutiveImprovements);
 
     return report;
   }

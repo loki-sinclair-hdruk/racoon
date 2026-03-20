@@ -37,7 +37,11 @@ export function loadBaseline(projectRoot: string): BaselineData | null {
   }
 }
 
-export function saveBaseline(projectRoot: string, report: ScanReport): void {
+export function saveBaseline(
+  projectRoot: string,
+  report: ScanReport,
+  consecutiveImprovements = 0,
+): void {
   const data: BaselineData = {
     version: 1,
     timestamp: new Date().toISOString(),
@@ -56,6 +60,8 @@ export function saveBaseline(projectRoot: string, report: ScanReport): void {
         evidenceCount: finding.evidence?.length ?? 0,
       })),
     ),
+    earnedAchievements: report.achievements?.map((a) => a.id) ?? [],
+    consecutiveImprovements,
   };
 
   const filePath = path.join(projectRoot, BASELINE_FILE);
