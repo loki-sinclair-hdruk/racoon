@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { Check, Dimension, Finding, ScanContext } from '../../../core/types.js';
+import { Check, Dimension, EvidenceItem, Finding, ScanContext } from '../../../core/types.js';
+import { classifyFile, mergePathRules, NEXTJS_REACT_PATH_RULES } from '../../../core/path-classifier.js';
 
 function readFile(context: ScanContext, rel: string): string {
   if (context.fileCache.has(rel)) return context.fileCache.get(rel)!;
@@ -13,10 +14,9 @@ function readFile(context: ScanContext, rel: string): string {
   }
 }
 
-function jsFiles(context: ScanContext): string[] {
-  return context.files.filter((f) =>
-    f.match(/\.(js|jsx|ts|tsx)$/) && !f.includes('node_modules'),
-  );
+function snip(line: string, maxLen = 80): string {
+  const t = line.trim();
+  return t.length > maxLen ? t.slice(0, maxLen - 1) + '…' : t;
 }
 
 // ─── Check: ESLint config presence ───────────────────────────────────────────
@@ -29,29 +29,20 @@ export const eslintConfigCheck: Check = {
 
   async run(context: ScanContext): Promise<Finding> {
     const configs = [
-      '.eslintrc',
-      '.eslintrc.js',
-      '.eslintrc.cjs',
-      '.eslintrc.json',
-      '.eslintrc.yaml',
-      '.eslintrc.yml',
-      'eslint.config.js',
-      'eslint.config.mjs',
+      '.eslintrc', '.eslintrc.js', '.eslintrc.cjs', '.eslintrc.json',
+      '.eslintrc.yaml', '.eslintrc.yml', 'eslint.config.js', 'eslint.config.mjs',
     ];
 
     const found = configs.find((c) => context.files.includes(c));
 
-    // Also check package.json for eslintConfig key
     const pkgFile = context.files.find((f) => f === 'package.json');
     let inPackageJson = false;
     if (pkgFile) {
-      const pkg = readFile(context, pkgFile);
-      inPackageJson = pkg.includes('"eslintConfig"');
+      inPackageJson = readFile(context, pkgFile).includes('"eslintConfig"');
     }
 
     const hasConfig = !!found || inPackageJson;
 
-    // Check if next/core-web-vitals or similar strict preset is used
     let usesStrictPreset = false;
     if (found) {
       const content = readFile(context, found);
@@ -70,7 +61,10 @@ export const eslintConfigCheck: Check = {
       score,
       maxScore: 100,
       severity: hasConfig ? 'info' : 'warning',
-      detail: { configFile: found ?? (inPackageJson ? 'package.json#eslintConfig' : null), usesStrictPreset },
+      detail: {
+        configFile: found ?? (inPackageJson ? 'package.json#eslintConfig' : null),
+        usesStrictPreset,
+      },
     };
   },
 };
@@ -84,32 +78,56 @@ export const componentSizeCheck: Check = {
   weight: 2,
 
   async run(context: ScanContext): Promise<Finding> {
-    const componentFiles = context.files.filter((f) =>
-      f.match(/\.(jsx|tsx)$/) && !f.includes('node_modules'),
+    const rules = mergePathRules(context.config.pathRules, NEXTJS_REACT_PATH_RULES);
+    const componentFiles = context.files.filter(
+      (f) => f.match(/\.(jsx|tsx)$/) && !f.includes('node_modules'),
     );
 
     if (componentFiles.length === 0) {
       return { message: 'No JSX/TSX component files found', score: 50, maxScore: 100, severity: 'info' };
     }
 
-    const largeComponents: string[] = [];
+    const evidence: EvidenceItem[] = [];
 
     for (const file of componentFiles) {
-      const lines = readFile(context, file).split('\n').length;
-      if (lines > 200) {
-        largeComponents.push(`${file} (${lines} lines)`);
-      }
+      const { weight, label } = classifyFile(file, rules);
+      if (weight === 0) continue;
+
+      const content = readFile(context, file);
+      const lines = content.split('\n');
+      if (lines.length <= 200) continue;
+
+      // Find the main component export as the evidence anchor
+      const exportIdx = lines.findIndex((l) =>
+        l.match(/export\s+(?:default\s+)?(?:function|const)\s+[A-Z]/),
+      );
+      const anchorIdx = exportIdx >= 0 ? exportIdx : 0;
+
+      evidence.push({
+        file,
+        line: anchorIdx + 1,
+        snippet: `${snip(lines[anchorIdx])}  [${lines.length} lines]`,
+        weight,
+        label,
+      });
     }
 
-    const ratio = largeComponents.length / componentFiles.length;
+    evidence.sort((a, b) => {
+      const aL = parseInt(a.snippet.match(/\[(\d+) lines\]/)?.[1] ?? '0', 10);
+      const bL = parseInt(b.snippet.match(/\[(\d+) lines\]/)?.[1] ?? '0', 10);
+      return bL - aL;
+    });
+
+    const ratio = evidence.length / componentFiles.length;
     const score = Math.round(Math.max(0, 100 - ratio * 200));
 
     return {
-      message: `${largeComponents.length}/${componentFiles.length} components exceed 200 lines`,
+      message: `${evidence.length}/${componentFiles.length} components exceed 200 lines`,
       score,
       maxScore: 100,
       severity: ratio > 0.3 ? 'warning' : 'info',
-      files: largeComponents.slice(0, 5),
+      files: evidence.map((e) => e.file),
+      evidence,
     };
   },
 };

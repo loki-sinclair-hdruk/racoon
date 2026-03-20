@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { Check, Dimension, Finding, ScanContext } from '../../../core/types.js';
+import { Check, Dimension, EvidenceItem, Finding, ScanContext } from '../../../core/types.js';
+import { classifyFile, mergePathRules, NEXTJS_REACT_PATH_RULES } from '../../../core/path-classifier.js';
 
 function readFile(context: ScanContext, rel: string): string {
   if (context.fileCache.has(rel)) return context.fileCache.get(rel)!;
@@ -13,9 +14,14 @@ function readFile(context: ScanContext, rel: string): string {
   }
 }
 
+function snip(line: string, maxLen = 80): string {
+  const t = line.trim();
+  return t.length > maxLen ? t.slice(0, maxLen - 1) + '…' : t;
+}
+
 function jsFiles(context: ScanContext): string[] {
-  return context.files.filter((f) =>
-    f.match(/\.(js|jsx|ts|tsx)$/) && !f.includes('node_modules'),
+  return context.files.filter(
+    (f) => f.match(/\.(js|jsx|ts|tsx)$/) && !f.includes('node_modules'),
   );
 }
 
@@ -28,16 +34,29 @@ export const nextImageCheck: Check = {
   weight: 2,
 
   async run(context: ScanContext): Promise<Finding> {
-    let rawImgTags = 0;
+    const rules = mergePathRules(context.config.pathRules, NEXTJS_REACT_PATH_RULES);
     let nextImageImports = 0;
+    const evidence: EvidenceItem[] = [];
 
     for (const file of jsFiles(context)) {
+      const { weight, label } = classifyFile(file, rules);
+      if (weight === 0) continue;
+
       const content = readFile(context, file);
-      rawImgTags       += (content.match(/<img\s/g) ?? []).length;
+      const lines = content.split('\n');
+
       nextImageImports += (content.match(/from\s+['"]next\/image['"]/g) ?? []).length;
+
+      for (let i = 0; i < lines.length; i++) {
+        if (/<img\s/i.test(lines[i])) {
+          evidence.push({ file, line: i + 1, snippet: snip(lines[i]), weight, label });
+        }
+      }
     }
 
-    const total = rawImgTags + nextImageImports;
+    evidence.sort((a, b) => (b.weight ?? 1) - (a.weight ?? 1));
+
+    const total = evidence.length + nextImageImports;
     if (total === 0) {
       return { message: 'No image usage found', score: 80, maxScore: 100, severity: 'info' };
     }
@@ -46,11 +65,13 @@ export const nextImageCheck: Check = {
     const score = Math.round(ratio * 100);
 
     return {
-      message: `${nextImageImports} next/image, ${rawImgTags} raw <img> tag(s)`,
+      message: `${nextImageImports} next/image import(s), ${evidence.length} raw <img> tag(s)`,
       score,
       maxScore: 100,
-      severity: rawImgTags > 0 && ratio < 0.5 ? 'warning' : 'info',
-      detail: { rawImgTags, nextImageImports },
+      severity: evidence.length > 0 && ratio < 0.5 ? 'warning' : 'info',
+      files: [...new Set(evidence.map((e) => e.file))],
+      evidence,
+      detail: { rawImgTags: evidence.length, nextImageImports },
     };
   },
 };
@@ -64,11 +85,15 @@ export const codeSplittingCheck: Check = {
   weight: 2,
 
   async run(context: ScanContext): Promise<Finding> {
+    const rules = mergePathRules(context.config.pathRules, NEXTJS_REACT_PATH_RULES);
     let dynamicImports = 0;
     let reactLazy = 0;
     let suspense = 0;
 
     for (const file of jsFiles(context)) {
+      const { weight } = classifyFile(file, rules);
+      if (weight === 0) continue;
+
       const content = readFile(context, file);
       dynamicImports += (content.match(/import\s*\(/g) ?? []).length;
       reactLazy      += (content.match(/React\.lazy\s*\(|lazy\s*\(\s*\(\s*\)/g) ?? []).length;
@@ -76,7 +101,9 @@ export const codeSplittingCheck: Check = {
     }
 
     const hasCodeSplitting = dynamicImports > 0 || reactLazy > 0;
-    const score = hasCodeSplitting ? Math.min(100, 60 + dynamicImports * 3 + reactLazy * 5) : 30;
+    const score = hasCodeSplitting
+      ? Math.min(100, 60 + dynamicImports * 3 + reactLazy * 5)
+      : 30;
 
     return {
       message: hasCodeSplitting
@@ -84,7 +111,7 @@ export const codeSplittingCheck: Check = {
         : 'No dynamic imports or React.lazy() detected',
       score,
       maxScore: 100,
-      severity: !hasCodeSplitting ? 'info' : 'info',
+      severity: 'info',
       detail: { dynamicImports, reactLazy, suspense },
     };
   },
@@ -99,8 +126,9 @@ export const memoizationCheck: Check = {
   weight: 1,
 
   async run(context: ScanContext): Promise<Finding> {
-    const componentFiles = context.files.filter((f) =>
-      f.match(/\.(jsx|tsx)$/) && !f.includes('node_modules'),
+    const rules = mergePathRules(context.config.pathRules, NEXTJS_REACT_PATH_RULES);
+    const componentFiles = context.files.filter(
+      (f) => f.match(/\.(jsx|tsx)$/) && !f.includes('node_modules'),
     );
 
     if (componentFiles.length === 0) {
@@ -112,9 +140,12 @@ export const memoizationCheck: Check = {
     let useCallbackCount = 0;
 
     for (const file of componentFiles) {
+      const { weight } = classifyFile(file, rules);
+      if (weight === 0) continue;
+
       const content = readFile(context, file);
-      memoCount       += (content.match(/React\.memo\s*\(|export\s+default\s+memo\s*\(/g) ?? []).length;
-      useMemoCount    += (content.match(/\buseMemo\s*\(/g) ?? []).length;
+      memoCount        += (content.match(/React\.memo\s*\(|export\s+default\s+memo\s*\(/g) ?? []).length;
+      useMemoCount     += (content.match(/\buseMemo\s*\(/g) ?? []).length;
       useCallbackCount += (content.match(/\buseCallback\s*\(/g) ?? []).length;
     }
 

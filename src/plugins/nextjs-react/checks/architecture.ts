@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { Check, Dimension, Finding, ScanContext } from '../../../core/types.js';
+import { Check, Dimension, EvidenceItem, Finding, ScanContext } from '../../../core/types.js';
+import { classifyFile, mergePathRules, NEXTJS_REACT_PATH_RULES } from '../../../core/path-classifier.js';
 
 function readFile(context: ScanContext, rel: string): string {
   if (context.fileCache.has(rel)) return context.fileCache.get(rel)!;
@@ -13,6 +14,11 @@ function readFile(context: ScanContext, rel: string): string {
   }
 }
 
+function snip(line: string, maxLen = 80): string {
+  const t = line.trim();
+  return t.length > maxLen ? t.slice(0, maxLen - 1) + '…' : t;
+}
+
 // ─── Check: App Router vs Pages Router consistency ────────────────────────────
 
 export const routerConsistencyCheck: Check = {
@@ -22,8 +28,8 @@ export const routerConsistencyCheck: Check = {
   weight: 2,
 
   async run(context: ScanContext): Promise<Finding> {
-    const hasAppDir    = context.files.some((f) => f.match(/^(?:src\/)?app\/(?!api\/)/));
-    const hasPagesDir  = context.files.some((f) => f.match(/^(?:src\/)?pages\/(?!api\/)/));
+    const hasAppDir   = context.files.some((f) => f.match(/^(?:src\/)?app\/(?!api\/)/));
+    const hasPagesDir = context.files.some((f) => f.match(/^(?:src\/)?pages\/(?!api\/)/));
 
     if (hasAppDir && hasPagesDir) {
       return {
@@ -35,29 +41,14 @@ export const routerConsistencyCheck: Check = {
     }
 
     if (hasAppDir) {
-      return {
-        message: 'Using App Router (app/ directory) consistently',
-        score: 100,
-        maxScore: 100,
-        severity: 'info',
-      };
+      return { message: 'Using App Router (app/ directory) consistently', score: 100, maxScore: 100, severity: 'info' };
     }
 
     if (hasPagesDir) {
-      return {
-        message: 'Using Pages Router (pages/ directory) consistently',
-        score: 80,
-        maxScore: 100,
-        severity: 'info',
-      };
+      return { message: 'Using Pages Router (pages/ directory) consistently', score: 80, maxScore: 100, severity: 'info' };
     }
 
-    return {
-      message: 'No app/ or pages/ directory found',
-      score: 30,
-      maxScore: 100,
-      severity: 'warning',
-    };
+    return { message: 'No app/ or pages/ directory found', score: 30, maxScore: 100, severity: 'warning' };
   },
 };
 
@@ -78,21 +69,44 @@ export const apiRoutesCheck: Check = {
       return { message: 'No API routes found', score: 70, maxScore: 80, severity: 'info' };
     }
 
-    // Check if API routes are doing too much (> 80 lines is a smell for routes)
-    const bloated: string[] = [];
+    const evidence: EvidenceItem[] = [];
+
     for (const file of apiRoutes) {
-      const lines = readFile(context, file).split('\n').length;
-      if (lines > 80) bloated.push(`${file} (${lines} lines)`);
+      const content = readFile(context, file);
+      const lines = content.split('\n');
+      if (lines.length <= 80) continue;
+
+      // Find the handler export as anchor
+      const handlerIdx = lines.findIndex((l) =>
+        l.match(/export\s+(?:default\s+)?(?:async\s+)?function/) ||
+        l.match(/export\s+const\s+\w+\s*=\s*(?:async\s+)?(?:req|request)/),
+      );
+      const anchorIdx = handlerIdx >= 0 ? handlerIdx : 0;
+
+      evidence.push({
+        file,
+        line: anchorIdx + 1,
+        snippet: `${snip(lines[anchorIdx])}  [${lines.length} lines]`,
+        weight: 1.5,
+        label: 'API route',
+      });
     }
 
-    const score = bloated.length === 0 ? 80 : Math.max(20, 80 - bloated.length * 15);
+    evidence.sort((a, b) => {
+      const aL = parseInt(a.snippet.match(/\[(\d+) lines\]/)?.[1] ?? '0', 10);
+      const bL = parseInt(b.snippet.match(/\[(\d+) lines\]/)?.[1] ?? '0', 10);
+      return bL - aL;
+    });
+
+    const score = evidence.length === 0 ? 80 : Math.max(20, 80 - evidence.length * 15);
 
     return {
-      message: `${apiRoutes.length} API route(s)${bloated.length > 0 ? `, ${bloated.length} overly large` : ''}`,
+      message: `${apiRoutes.length} API route(s)${evidence.length > 0 ? `, ${evidence.length} overly large (>80 lines)` : ''}`,
       score,
       maxScore: 80,
-      severity: bloated.length > 3 ? 'warning' : 'info',
-      files: bloated.slice(0, 3),
+      severity: evidence.length > 3 ? 'warning' : 'info',
+      files: evidence.map((e) => e.file),
+      evidence,
     };
   },
 };
@@ -106,15 +120,20 @@ export const serverClientSeparationCheck: Check = {
   weight: 3,
 
   async run(context: ScanContext): Promise<Finding> {
-    // Only meaningful for App Router projects
+    const rules = mergePathRules(context.config.pathRules, NEXTJS_REACT_PATH_RULES);
     const hasAppDir = context.files.some((f) => f.match(/^(?:src\/)?app\//));
 
     if (!hasAppDir) {
-      return { message: 'App Router not detected — check not applicable', score: 70, maxScore: 80, severity: 'info' };
+      return {
+        message: 'App Router not detected — check not applicable',
+        score: 70,
+        maxScore: 80,
+        severity: 'info',
+      };
     }
 
-    const appFiles = context.files.filter((f) =>
-      f.match(/^(?:src\/)?app\/.*\.(tsx?|jsx?)$/) && !f.includes('node_modules'),
+    const appFiles = context.files.filter(
+      (f) => f.match(/^(?:src\/)?app\/.*\.(tsx?|jsx?)$/) && !f.includes('node_modules'),
     );
 
     if (appFiles.length === 0) {
@@ -124,20 +143,47 @@ export const serverClientSeparationCheck: Check = {
     let serverComponents = 0;
     let clientComponents = 0;
     let unspecified = 0;
-
-    // Client components that use server-only APIs
-    const serverApiInClientFiles: string[] = [];
+    const evidence: EvidenceItem[] = [];
 
     for (const file of appFiles) {
+      const { weight, label } = classifyFile(file, rules);
+      // Don't skip weight=0 here — server/client violations are always critical
       const content = readFile(context, file);
-      const isClient = content.trimStart().startsWith('"use client"') || content.trimStart().startsWith("'use client'");
-      const isServer = content.trimStart().startsWith('"use server"') || content.trimStart().startsWith("'use server'");
+      const lines = content.split('\n');
+
+      const isClient =
+        content.trimStart().startsWith('"use client"') ||
+        content.trimStart().startsWith("'use client'");
+      const isServer =
+        content.trimStart().startsWith('"use server"') ||
+        content.trimStart().startsWith("'use server'");
 
       if (isClient) {
         clientComponents++;
-        // Client components shouldn't use server-only modules
-        if (content.includes('import') && (content.includes('server-only') || content.includes('next/headers') || content.includes('next/cookies'))) {
-          serverApiInClientFiles.push(file);
+        // Client components importing server-only modules is a violation
+        if (
+          content.includes('import') &&
+          (content.includes('server-only') ||
+            content.includes('next/headers') ||
+            content.includes('next/cookies'))
+        ) {
+          // Find the problematic import line
+          for (let i = 0; i < lines.length; i++) {
+            if (
+              lines[i].includes('server-only') ||
+              lines[i].includes('next/headers') ||
+              lines[i].includes('next/cookies')
+            ) {
+              evidence.push({
+                file,
+                line: i + 1,
+                snippet: snip(lines[i]),
+                weight: weight === 0 ? 0.5 : weight, // always show violations, even in reduced-weight files
+                label,
+              });
+              break;
+            }
+          }
         }
       } else if (isServer) {
         serverComponents++;
@@ -146,15 +192,17 @@ export const serverClientSeparationCheck: Check = {
       }
     }
 
-    const issues = serverApiInClientFiles.length;
-    const score = issues === 0 ? 80 : Math.max(20, 80 - issues * 20);
+    evidence.sort((a, b) => (b.weight ?? 1) - (a.weight ?? 1));
+
+    const score = evidence.length === 0 ? 80 : Math.max(20, 80 - evidence.length * 20);
 
     return {
-      message: `${serverComponents} server, ${clientComponents} client, ${unspecified} unspecified components${issues > 0 ? ` — ${issues} client component(s) import server-only modules` : ''}`,
+      message: `${serverComponents} server, ${clientComponents} client, ${unspecified} unspecified components${evidence.length > 0 ? ` — ${evidence.length} client component(s) import server-only modules` : ''}`,
       score,
       maxScore: 80,
-      severity: issues > 0 ? 'critical' : 'info',
-      files: serverApiInClientFiles.slice(0, 5),
+      severity: evidence.length > 0 ? 'critical' : 'info',
+      files: [...new Set(evidence.map((e) => e.file))],
+      evidence,
       detail: { serverComponents, clientComponents, unspecified },
     };
   },

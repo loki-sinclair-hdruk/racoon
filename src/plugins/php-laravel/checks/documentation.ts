@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { Check, Dimension, Finding, ScanContext } from '../../../core/types.js';
+import { Check, Dimension, EvidenceItem, Finding, ScanContext } from '../../../core/types.js';
+import { classifyFile, mergePathRules, PHP_LARAVEL_PATH_RULES } from '../../../core/path-classifier.js';
 
 function readFile(context: ScanContext, rel: string): string {
   if (context.fileCache.has(rel)) return context.fileCache.get(rel)!;
@@ -11,6 +12,11 @@ function readFile(context: ScanContext, rel: string): string {
   } catch {
     return '';
   }
+}
+
+function snip(line: string, maxLen = 80): string {
+  const t = line.trim();
+  return t.length > maxLen ? t.slice(0, maxLen - 1) + '…' : t;
 }
 
 // ─── Check: README presence & quality ────────────────────────────────────────
@@ -27,18 +33,12 @@ export const readmeCheck: Check = {
     );
 
     if (!readmeFile) {
-      return {
-        message: 'No README found',
-        score: 0,
-        maxScore: 100,
-        severity: 'warning',
-      };
+      return { message: 'No README found', score: 0, maxScore: 100, severity: 'warning' };
     }
 
     const content = readFile(context, readmeFile);
     const wordCount = content.split(/\s+/).filter(Boolean).length;
 
-    // Check for common README sections
     const hasSections = {
       install: /##?\s*install/i.test(content),
       usage:   /##?\s*usage/i.test(content),
@@ -47,7 +47,7 @@ export const readmeCheck: Check = {
     };
     const sectionScore = Object.values(hasSections).filter(Boolean).length * 15;
     const lengthScore  = Math.min(40, Math.round((wordCount / 200) * 40));
-    const score = Math.min(100, sectionScore + lengthScore);
+    const score        = Math.min(100, sectionScore + lengthScore);
 
     return {
       message: `README found (${wordCount} words, ${Object.values(hasSections).filter(Boolean).length}/4 key sections)`,
@@ -68,6 +68,7 @@ export const phpDocCoverageCheck: Check = {
   weight: 2,
 
   async run(context: ScanContext): Promise<Finding> {
+    const rules = mergePathRules(context.config.pathRules, PHP_LARAVEL_PATH_RULES);
     const phpFiles = context.files.filter(
       (f) => f.endsWith('.php') && !f.startsWith('vendor/'),
     );
@@ -78,19 +79,30 @@ export const phpDocCoverageCheck: Check = {
 
     let publicMethods = 0;
     let documentedMethods = 0;
+    const evidence: EvidenceItem[] = [];
 
     for (const file of phpFiles) {
+      const { weight, label } = classifyFile(file, rules);
+      if (weight === 0) continue;
+
       const content = readFile(context, file);
       const lines = content.split('\n');
 
       for (let i = 0; i < lines.length; i++) {
-        if (lines[i].match(/^\s+public\s+function\s+\w+/)) {
-          publicMethods++;
-          // Look back up to 5 lines for a docblock
-          const lookback = lines.slice(Math.max(0, i - 5), i).join('\n');
-          if (lookback.includes('*/')) {
-            documentedMethods++;
-          }
+        if (!lines[i].match(/^\s+public\s+function\s+\w+/)) continue;
+
+        publicMethods++;
+        const lookback = lines.slice(Math.max(0, i - 5), i).join('\n');
+        if (lookback.includes('*/')) {
+          documentedMethods++;
+        } else {
+          evidence.push({
+            file,
+            line: i + 1,
+            snippet: snip(lines[i]),
+            weight,
+            label,
+          });
         }
       }
     }
@@ -98,6 +110,9 @@ export const phpDocCoverageCheck: Check = {
     if (publicMethods === 0) {
       return { message: 'No public methods found', score: 50, maxScore: 100, severity: 'info' };
     }
+
+    // Sort: highest-impact paths first
+    evidence.sort((a, b) => (b.weight ?? 1) - (a.weight ?? 1));
 
     const ratio = documentedMethods / publicMethods;
     const score = Math.round(ratio * 100);
@@ -107,6 +122,8 @@ export const phpDocCoverageCheck: Check = {
       score,
       maxScore: 100,
       severity: ratio < 0.3 ? 'warning' : 'info',
+      files: [...new Set(evidence.map((e) => e.file))],
+      evidence: evidence.slice(0, 10),
       detail: { documentedMethods, publicMethods, ratio },
     };
   },
@@ -129,7 +146,7 @@ export const changelogCheck: Check = {
       message: hasChangelog ? 'CHANGELOG present' : 'No CHANGELOG found',
       score: hasChangelog ? 80 : 30,
       maxScore: 80,
-      severity: hasChangelog ? 'info' : 'info',
+      severity: 'info',
     };
   },
 };

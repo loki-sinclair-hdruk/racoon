@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { Check, Dimension, Finding, ScanContext } from '../../../core/types.js';
+import { Check, Dimension, EvidenceItem, Finding, ScanContext } from '../../../core/types.js';
+import { classifyFile, mergePathRules, NEXTJS_REACT_PATH_RULES } from '../../../core/path-classifier.js';
 
 function readFile(context: ScanContext, rel: string): string {
   if (context.fileCache.has(rel)) return context.fileCache.get(rel)!;
@@ -13,6 +14,11 @@ function readFile(context: ScanContext, rel: string): string {
   }
 }
 
+function snip(line: string, maxLen = 80): string {
+  const t = line.trim();
+  return t.length > maxLen ? t.slice(0, maxLen - 1) + '…' : t;
+}
+
 // ─── Check: Feature-based file structure ──────────────────────────────────────
 
 export const fileStructureCheck: Check = {
@@ -22,7 +28,6 @@ export const fileStructureCheck: Check = {
   weight: 2,
 
   async run(context: ScanContext): Promise<Finding> {
-    // Feature-based is preferred: src/features/, src/modules/, src/components/
     const hasFeatureDir   = context.files.some((f) => f.match(/^src\/features?\//));
     const hasModulesDir   = context.files.some((f) => f.match(/^src\/modules?\//));
     const hasComponentDir = context.files.some((f) => f.match(/^(?:src\/)?components\//));
@@ -71,8 +76,7 @@ export const envVarUsageCheck: Check = {
     const hasEnvExample = context.files.some((f) =>
       f.match(/^\.env\.(?:example|sample|template)$/),
     );
-    const hasEnvLocal = context.files.includes('.env.local');
-    const hasEnvProd  = context.files.some((f) =>
+    const hasEnvProd = context.files.some((f) =>
       f.match(/^\.env\.(?:prod|production)$/),
     );
 
@@ -80,7 +84,6 @@ export const envVarUsageCheck: Check = {
     if (!hasEnvExample) issues.push('No .env.example found');
     if (hasEnvProd)     issues.push('.env.production committed to repo');
 
-    // Check .gitignore covers .env files
     const gitignore = context.files.find((f) => f === '.gitignore');
     if (gitignore) {
       const content = readFile(context, gitignore);
@@ -109,42 +112,55 @@ export const apiAbstractionCheck: Check = {
   weight: 1,
 
   async run(context: ScanContext): Promise<Finding> {
-    const apiFiles = context.files.filter((f) =>
-      f.match(/^(?:src\/)?(?:api|services?|lib)\/.+\.(ts|tsx|js|jsx)$/) &&
-      !f.includes('node_modules'),
+    const rules = mergePathRules(context.config.pathRules, NEXTJS_REACT_PATH_RULES);
+    const apiFiles = context.files.filter(
+      (f) =>
+        f.match(/^(?:src\/)?(?:api|services?|lib)\/.+\.(ts|tsx|js|jsx)$/) &&
+        !f.includes('node_modules'),
     );
 
-    const componentFiles = context.files.filter((f) =>
-      f.match(/\.(jsx|tsx)$/) &&
-      !f.match(/^(?:pages|app)\/api\//) &&
-      !f.includes('node_modules'),
+    const componentFiles = context.files.filter(
+      (f) =>
+        f.match(/\.(jsx|tsx)$/) &&
+        !f.match(/^(?:pages|app)\/api\//) &&
+        !f.includes('node_modules'),
     );
 
-    // Check for raw fetch/axios calls directly in components
-    let rawFetchInComponents = 0;
+    const rawFetchPattern = /\bfetch\s*\(|axios\.(?:get|post|put|delete|patch)\s*\(/;
+    const evidence: EvidenceItem[] = [];
+
     for (const file of componentFiles) {
+      const { weight, label } = classifyFile(file, rules);
+      if (weight === 0) continue;
+
       const content = readFile(context, file);
-      if (
-        content.match(/\bfetch\s*\(/) ||
-        content.match(/axios\.(?:get|post|put|delete|patch)\s*\(/)
-      ) {
-        rawFetchInComponents++;
+      const lines = content.split('\n');
+
+      for (let i = 0; i < lines.length; i++) {
+        if (rawFetchPattern.test(lines[i])) {
+          evidence.push({ file, line: i + 1, snippet: snip(lines[i]), weight, label });
+          break; // one evidence item per component file
+        }
       }
     }
 
+    evidence.sort((a, b) => (b.weight ?? 1) - (a.weight ?? 1));
+
     const hasAbstraction = apiFiles.length > 0;
     const score = hasAbstraction
-      ? Math.max(40, 100 - rawFetchInComponents * 10)
-      : Math.max(0, 40 - rawFetchInComponents * 5);
+      ? Math.max(40, 100 - evidence.length * 10)
+      : Math.max(0, 40 - evidence.length * 5);
 
     return {
       message: hasAbstraction
-        ? `${apiFiles.length} API abstraction file(s); ${rawFetchInComponents} component(s) with raw fetch calls`
-        : `No API abstraction layer — ${rawFetchInComponents} component(s) make raw fetch/axios calls`,
+        ? `${apiFiles.length} API abstraction file(s); ${evidence.length} component(s) with raw fetch calls`
+        : `No API abstraction layer — ${evidence.length} component(s) make raw fetch/axios calls`,
       score,
       maxScore: 100,
-      severity: !hasAbstraction && rawFetchInComponents > 3 ? 'warning' : 'info',
-      detail: { apiFiles: apiFiles.length, rawFetchInComponents },
+      severity: !hasAbstraction && evidence.length > 3 ? 'warning' : 'info',
+      files: [...new Set(evidence.map((e) => e.file))],
+      evidence,
+      detail: { apiFiles: apiFiles.length, rawFetchInComponents: evidence.length },
     };
   },
 };

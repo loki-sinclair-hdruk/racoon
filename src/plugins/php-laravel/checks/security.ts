@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { Check, Dimension, Finding, ScanContext } from '../../../core/types.js';
+import { Check, Dimension, EvidenceItem, Finding, ScanContext } from '../../../core/types.js';
+import { classifyFile, mergePathRules, PHP_LARAVEL_PATH_RULES } from '../../../core/path-classifier.js';
 
 function readFile(context: ScanContext, rel: string): string {
   if (context.fileCache.has(rel)) return context.fileCache.get(rel)!;
@@ -13,6 +14,24 @@ function readFile(context: ScanContext, rel: string): string {
   }
 }
 
+function snip(line: string, maxLen = 80): string {
+  const t = line.trim();
+  return t.length > maxLen ? t.slice(0, maxLen - 1) + '…' : t;
+}
+
+/** Replace secret values in a line with [REDACTED] for safe display. */
+function redact(line: string): string {
+  return line
+    .replace(
+      /((?:password|passwd|pwd|secret|api[_\-]?key|auth[_\-]?token)\s*=\s*)(['"])[^'"]{4,}(['"])/gi,
+      '$1$2[REDACTED]$3',
+    )
+    .replace(
+      /(define\(['"][A-Z_]*(SECRET|KEY|TOKEN|PASSWORD)[A-Z_]*['"],\s*)(['"])[^'"]{4,}(['"])/gi,
+      '$1$3[REDACTED]$4',
+    );
+}
+
 // ─── Check: Hardcoded secrets ─────────────────────────────────────────────────
 
 export const hardcodedSecretsCheck: Check = {
@@ -22,39 +41,56 @@ export const hardcodedSecretsCheck: Check = {
   weight: 4,
 
   async run(context: ScanContext): Promise<Finding> {
+    const rules = mergePathRules(context.config.pathRules, PHP_LARAVEL_PATH_RULES);
     const phpFiles = context.files.filter(
       (f) => f.endsWith('.php') && !f.startsWith('vendor/'),
     );
 
-    // Patterns that strongly suggest hardcoded credentials
     const secretPatterns = [
-      { pattern: /(['"])(?:password|passwd|pwd|secret|api[_-]?key|auth[_-]?token)\1\s*=\s*(['"])[^'"]{6,}\2/gi, label: 'password/key assignment' },
-      { pattern: /\$_ENV\[['"][A-Z_]+['"]\]\s*=\s*['"][^'"]{6,}['"]/g, label: 'ENV override' },
-      { pattern: /define\(['"][A-Z_]*(SECRET|KEY|TOKEN|PASSWORD)[A-Z_]*['"],\s*['"][^'"]{6,}['"]/g, label: 'define() constant' },
+      /(['"])(?:password|passwd|pwd|secret|api[_-]?key|auth[_-]?token)\1\s*=\s*(['"])[^'"]{6,}\2/i,
+      /\$_ENV\[['"][A-Z_]+['"]\]\s*=\s*['"][^'"]{6,}['"]/,
+      /define\(['"][A-Z_]*(SECRET|KEY|TOKEN|PASSWORD)[A-Z_]*['"],\s*['"][^'"]{6,}['"]/,
     ];
 
-    const hits: string[] = [];
+    const evidence: EvidenceItem[] = [];
 
     for (const file of phpFiles) {
+      const { weight, label } = classifyFile(file, rules);
+      if (weight === 0) continue;
+
       const content = readFile(context, file);
-      for (const { pattern, label } of secretPatterns) {
-        const matches = content.match(pattern) ?? [];
-        if (matches.length > 0) {
-          hits.push(`${file} (${label})`);
+      const lines = content.split('\n');
+
+      for (let i = 0; i < lines.length; i++) {
+        for (const pattern of secretPatterns) {
+          if (pattern.test(lines[i])) {
+            evidence.push({
+              file,
+              line: i + 1,
+              snippet: snip(redact(lines[i])),
+              weight,
+              label,
+            });
+            break; // one evidence item per line
+          }
         }
       }
     }
 
-    const score = hits.length === 0 ? 100 : Math.max(0, 100 - hits.length * 25);
+    evidence.sort((a, b) => (b.weight ?? 1) - (a.weight ?? 1));
+
+    const score = evidence.length === 0 ? 100 : Math.max(0, 100 - evidence.length * 25);
 
     return {
-      message: hits.length === 0
-        ? 'No hardcoded secrets detected'
-        : `${hits.length} potential hardcoded secret(s) found`,
+      message:
+        evidence.length === 0
+          ? 'No hardcoded secrets detected'
+          : `${evidence.length} potential hardcoded secret(s) found`,
       score,
       maxScore: 100,
-      severity: hits.length > 0 ? 'critical' : 'info',
-      files: hits.slice(0, 5),
+      severity: evidence.length > 0 ? 'critical' : 'info',
+      files: [...new Set(evidence.map((e) => e.file))],
+      evidence,
     };
   },
 };
@@ -68,40 +104,54 @@ export const sqlInjectionCheck: Check = {
   weight: 4,
 
   async run(context: ScanContext): Promise<Finding> {
+    const rules = mergePathRules(context.config.pathRules, PHP_LARAVEL_PATH_RULES);
     const phpFiles = context.files.filter(
       (f) => f.endsWith('.php') && !f.startsWith('vendor/'),
     );
 
-    // Raw DB::statement or DB::select with string interpolation = dangerous
     const riskyPatterns = [
-      /DB::(?:statement|select|insert|update|delete)\s*\(\s*["'`][^)]*\$[a-zA-Z_]/g,
-      /\$(?:pdo|db|conn)\s*->\s*query\s*\(\s*["'`][^)]*\$[a-zA-Z_]/g,
-      /whereRaw\s*\(\s*["'`][^)]*\$[a-zA-Z_]/g,
-      /selectRaw\s*\(\s*["'`][^)]*\$[a-zA-Z_]/g,
+      /DB::(?:statement|select|insert|update|delete)\s*\(\s*["'`][^)]*\$[a-zA-Z_]/,
+      /\$(?:pdo|db|conn)\s*->\s*query\s*\(\s*["'`][^)]*\$[a-zA-Z_]/,
+      /whereRaw\s*\(\s*["'`][^)]*\$[a-zA-Z_]/,
+      /selectRaw\s*\(\s*["'`][^)]*\$[a-zA-Z_]/,
     ];
 
-    const hits: string[] = [];
+    const evidence: EvidenceItem[] = [];
 
     for (const file of phpFiles) {
+      const { weight, label } = classifyFile(file, rules);
+      if (weight === 0) continue;
+
       const content = readFile(context, file);
-      for (const pattern of riskyPatterns) {
-        if (pattern.test(content)) {
-          hits.push(file);
-          break;
+      const lines = content.split('\n');
+      let fileHit = false;
+
+      for (let i = 0; i < lines.length; i++) {
+        if (fileHit) break;
+        for (const pattern of riskyPatterns) {
+          if (pattern.test(lines[i])) {
+            evidence.push({ file, line: i + 1, snippet: snip(lines[i]), weight, label });
+            fileHit = true;
+            break;
+          }
         }
       }
     }
 
-    const score = hits.length === 0 ? 100 : Math.max(0, 100 - hits.length * 20);
+    evidence.sort((a, b) => (b.weight ?? 1) - (a.weight ?? 1));
+
+    const score = evidence.length === 0 ? 100 : Math.max(0, 100 - evidence.length * 20);
 
     return {
-      message: hits.length === 0
-        ? 'No raw SQL with variable interpolation detected'
-        : `${hits.length} file(s) with potential SQL injection risk`,
+      message:
+        evidence.length === 0
+          ? 'No raw SQL with variable interpolation detected'
+          : `${evidence.length} file(s) with potential SQL injection risk`,
       score,
       maxScore: 100,
-      severity: hits.length > 0 ? 'critical' : 'info',
-      files: hits.slice(0, 5),
+      severity: evidence.length > 0 ? 'critical' : 'info',
+      files: evidence.map((e) => e.file),
+      evidence,
     };
   },
 };
@@ -117,20 +167,17 @@ export const envExposureCheck: Check = {
   async run(context: ScanContext): Promise<Finding> {
     const issues: string[] = [];
 
-    // .env should not be committed (presence is a sign it might be)
     if (context.files.includes('.env')) {
       issues.push('.env file present in repository');
     }
 
-    // .env.example is fine (and good), but .env.* production files are not
-    const envFiles = context.files.filter(
-      (f) => f.match(/^\.env\.(prod|production|staging|live)$/),
+    const envFiles = context.files.filter((f) =>
+      f.match(/^\.env\.(prod|production|staging|live)$/),
     );
     for (const f of envFiles) {
       issues.push(`${f} found in repository`);
     }
 
-    // .gitignore should include .env
     const gitignore = context.files.find((f) => f === '.gitignore');
     if (gitignore) {
       const content = readFile(context, gitignore);
@@ -144,9 +191,7 @@ export const envExposureCheck: Check = {
     const score = issues.length === 0 ? 100 : Math.max(0, 100 - issues.length * 30);
 
     return {
-      message: issues.length === 0
-        ? '.env handling looks safe'
-        : issues.join('; '),
+      message: issues.length === 0 ? '.env handling looks safe' : issues.join('; '),
       score,
       maxScore: 100,
       severity: issues.some((i) => i.includes('.env file present')) ? 'critical' : 'warning',
@@ -173,13 +218,11 @@ export const massAssignmentCheck: Check = {
 
     let guardedCount = 0;
     let fillableCount = 0;
-    let unprotectedModels = 0;
-    const unprotected: string[] = [];
+    const evidence: EvidenceItem[] = [];
 
     for (const file of models) {
       const content = readFile(context, file);
 
-      // Only check files that extend Model
       if (!content.includes('extends Model') && !content.includes('extends Authenticatable')) {
         continue;
       }
@@ -187,27 +230,39 @@ export const massAssignmentCheck: Check = {
       const hasGuarded  = content.includes('$guarded');
       const hasFillable = content.includes('$fillable');
 
-      if (hasGuarded) guardedCount++;
-      else if (hasFillable) fillableCount++;
-      else {
-        unprotectedModels++;
-        unprotected.push(file);
+      if (hasGuarded) {
+        guardedCount++;
+      } else if (hasFillable) {
+        fillableCount++;
+      } else {
+        // Find the class declaration line as the anchor
+        const lines = content.split('\n');
+        const classLineIdx = lines.findIndex((l) => l.match(/class\s+\w+.*extends\s+(?:Model|Authenticatable)/));
+        const anchorIdx = classLineIdx >= 0 ? classLineIdx : 0;
+        evidence.push({
+          file,
+          line: anchorIdx + 1,
+          snippet: snip(lines[anchorIdx]),
+          weight: 1.0,
+          label: 'model',
+        });
       }
     }
 
-    const totalModels = guardedCount + fillableCount + unprotectedModels;
+    const totalModels = guardedCount + fillableCount + evidence.length;
     if (totalModels === 0) {
       return { message: 'No Eloquent models found', score: 70, maxScore: 100, severity: 'info' };
     }
 
-    const score = Math.round(Math.max(0, 100 - (unprotectedModels / totalModels) * 100));
+    const score = Math.round(Math.max(0, 100 - (evidence.length / totalModels) * 100));
 
     return {
-      message: `${unprotectedModels}/${totalModels} models lack $fillable/$guarded`,
+      message: `${evidence.length}/${totalModels} models lack $fillable/$guarded`,
       score,
       maxScore: 100,
-      severity: unprotectedModels > 0 ? 'warning' : 'info',
-      files: unprotected.slice(0, 5),
+      severity: evidence.length > 0 ? 'warning' : 'info',
+      files: evidence.map((e) => e.file),
+      evidence,
     };
   },
 };

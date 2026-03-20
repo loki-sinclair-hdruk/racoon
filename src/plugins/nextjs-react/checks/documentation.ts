@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { Check, Dimension, Finding, ScanContext } from '../../../core/types.js';
+import { Check, Dimension, EvidenceItem, Finding, ScanContext } from '../../../core/types.js';
+import { classifyFile, mergePathRules, NEXTJS_REACT_PATH_RULES } from '../../../core/path-classifier.js';
 
 function readFile(context: ScanContext, rel: string): string {
   if (context.fileCache.has(rel)) return context.fileCache.get(rel)!;
@@ -11,6 +12,11 @@ function readFile(context: ScanContext, rel: string): string {
   } catch {
     return '';
   }
+}
+
+function snip(line: string, maxLen = 80): string {
+  const t = line.trim();
+  return t.length > maxLen ? t.slice(0, maxLen - 1) + '…' : t;
 }
 
 // ─── Check: README quality ────────────────────────────────────────────────────
@@ -62,8 +68,9 @@ export const jsDocCheck: Check = {
   weight: 1,
 
   async run(context: ScanContext): Promise<Finding> {
-    const tsFiles = context.files.filter((f) =>
-      f.match(/\.(ts|tsx)$/) && !f.match(/\.d\.ts$/) && !f.includes('node_modules'),
+    const rules = mergePathRules(context.config.pathRules, NEXTJS_REACT_PATH_RULES);
+    const tsFiles = context.files.filter(
+      (f) => f.match(/\.(ts|tsx)$/) && !f.match(/\.d\.ts$/) && !f.includes('node_modules'),
     );
 
     if (tsFiles.length === 0) {
@@ -72,17 +79,35 @@ export const jsDocCheck: Check = {
 
     let exportedFunctions = 0;
     let documented = 0;
+    const evidence: EvidenceItem[] = [];
 
     for (const file of tsFiles) {
+      const { weight, label } = classifyFile(file, rules);
+      if (weight === 0) continue;
+
       const content = readFile(context, file);
       const lines = content.split('\n');
 
       for (let i = 0; i < lines.length; i++) {
-        if (lines[i].match(/^export\s+(?:async\s+)?function\s+\w+/) ||
-            lines[i].match(/^export\s+const\s+\w+\s*=\s*(?:async\s+)?\(/)) {
-          exportedFunctions++;
-          const lookback = lines.slice(Math.max(0, i - 4), i).join('\n');
-          if (lookback.includes('*/')) documented++;
+        const isExport =
+          lines[i].match(/^export\s+(?:async\s+)?function\s+\w+/) ||
+          lines[i].match(/^export\s+const\s+\w+\s*=\s*(?:async\s+)?\(/);
+
+        if (!isExport) continue;
+
+        exportedFunctions++;
+        const lookback = lines.slice(Math.max(0, i - 4), i).join('\n');
+
+        if (lookback.includes('*/')) {
+          documented++;
+        } else {
+          evidence.push({
+            file,
+            line: i + 1,
+            snippet: snip(lines[i]),
+            weight,
+            label,
+          });
         }
       }
     }
@@ -90,6 +115,8 @@ export const jsDocCheck: Check = {
     if (exportedFunctions === 0) {
       return { message: 'No exported functions found', score: 50, maxScore: 80, severity: 'info' };
     }
+
+    evidence.sort((a, b) => (b.weight ?? 1) - (a.weight ?? 1));
 
     const ratio = documented / exportedFunctions;
     const score = Math.round(ratio * 80);
@@ -99,6 +126,8 @@ export const jsDocCheck: Check = {
       score,
       maxScore: 80,
       severity: ratio < 0.3 ? 'warning' : 'info',
+      files: [...new Set(evidence.map((e) => e.file))],
+      evidence: evidence.slice(0, 10),
       detail: { documented, exportedFunctions },
     };
   },
@@ -113,8 +142,8 @@ export const storybookCheck: Check = {
   weight: 1,
 
   async run(context: ScanContext): Promise<Finding> {
-    const hasStorybookDir  = context.files.some((f) => f.startsWith('.storybook/'));
-    const hasStoryFiles    = context.files.some((f) => f.match(/\.stories\.(tsx?|jsx?)$/));
+    const hasStorybookDir = context.files.some((f) => f.startsWith('.storybook/'));
+    const hasStoryFiles   = context.files.some((f) => f.match(/\.stories\.(tsx?|jsx?)$/));
 
     const score =
       hasStorybookDir && hasStoryFiles ? 100 :
@@ -122,7 +151,7 @@ export const storybookCheck: Check = {
 
     return {
       message:
-        hasStorybookDir && hasStoryFiles ? 'Storybook configured with story files'  :
+        hasStorybookDir && hasStoryFiles ? 'Storybook configured with story files' :
         hasStoryFiles                    ? 'Story files found but no .storybook/ dir' :
         'No Storybook detected',
       score,

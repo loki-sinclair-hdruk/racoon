@@ -1,6 +1,17 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { Check, Dimension, Finding, ScanContext } from '../../../core/types.js';
+import {
+  Check,
+  Dimension,
+  EvidenceItem,
+  Finding,
+  ScanContext,
+} from '../../../core/types.js';
+import {
+  classifyFile,
+  mergePathRules,
+  PHP_LARAVEL_PATH_RULES,
+} from '../../../core/path-classifier.js';
 
 function readFile(context: ScanContext, rel: string): string {
   if (context.fileCache.has(rel)) return context.fileCache.get(rel)!;
@@ -13,6 +24,11 @@ function readFile(context: ScanContext, rel: string): string {
   }
 }
 
+function snip(line: string, maxLen = 80): string {
+  const trimmed = line.trim();
+  return trimmed.length > maxLen ? trimmed.slice(0, maxLen - 1) + '…' : trimmed;
+}
+
 // ─── Check: N+1 query risk ────────────────────────────────────────────────────
 
 export const nPlusOneCheck: Check = {
@@ -22,41 +38,69 @@ export const nPlusOneCheck: Check = {
   weight: 3,
 
   async run(context: ScanContext): Promise<Finding> {
+    const rules = mergePathRules(context.config.pathRules, PHP_LARAVEL_PATH_RULES);
+
     const phpFiles = context.files.filter(
       (f) => f.endsWith('.php') && !f.startsWith('vendor/'),
     );
 
-    const hits: string[] = [];
+    const queryPattern =
+      /->(?:find|where|whereIn|first|firstOrFail|get|all|count|sum|pluck)\s*\(/;
+    const dbFacadePattern = /DB::(?:table|select|statement|raw)\s*\(/;
+    const relationTraversalPattern = /\$\w+->(?!\s*with\s*\()([a-zA-Z_]+)\s*(?:->|\[)/;
+
+    const evidence: EvidenceItem[] = [];
+    let weightedHits = 0;
 
     for (const file of phpFiles) {
+      const { weight, label } = classifyFile(file, rules);
+      if (weight === 0) continue; // excluded (tests, factories, seeders)
+
       const content = readFile(context, file);
+      if (!content) continue;
       const lines = content.split('\n');
 
-      // Heuristic: a loop that contains a query/relationship access
-      // Pattern: foreach/for followed within 5 lines by ->find, ->where, ->first, relationship access
       for (let i = 0; i < lines.length; i++) {
-        if (lines[i].match(/\b(foreach|for)\s*\(/)) {
-          const window = lines.slice(i + 1, i + 8).join('\n');
+        if (!lines[i].match(/\b(foreach|for)\s*\(/)) continue;
+
+        const windowLines = lines.slice(i + 1, i + 11);
+        for (let j = 0; j < windowLines.length; j++) {
+          const inner = windowLines[j];
           if (
-            window.match(/->(?:find|where|first|get|all)\s*\(/) ||
-            window.match(/DB::(?:table|select|statement)\s*\(/)
+            queryPattern.test(inner) ||
+            dbFacadePattern.test(inner) ||
+            relationTraversalPattern.test(inner)
           ) {
-            hits.push(`${file}:${i + 1}`);
+            weightedHits += weight;
+            evidence.push({
+              file,
+              line: i + 2 + j,
+              snippet: snip(inner),
+              weight,
+              label,
+            });
+            break; // one hit per loop block
           }
         }
       }
     }
 
-    const score = hits.length === 0 ? 100 : Math.max(0, 100 - hits.length * 15);
+    // Sort: highest-weight (most critical) first
+    evidence.sort((a, b) => (b.weight ?? 1) - (a.weight ?? 1));
+
+    const score =
+      weightedHits === 0 ? 100 : Math.max(0, 100 - Math.round(weightedHits * 12));
 
     return {
-      message: hits.length === 0
-        ? 'No obvious N+1 query patterns detected'
-        : `${hits.length} potential N+1 query pattern(s) found`,
+      message:
+        evidence.length === 0
+          ? 'No obvious N+1 query patterns detected'
+          : `${evidence.length} potential N+1 pattern(s) found (weighted impact: ${weightedHits.toFixed(1)})`,
       score,
       maxScore: 100,
-      severity: hits.length > 3 ? 'critical' : hits.length > 0 ? 'warning' : 'info',
-      files: hits.slice(0, 5),
+      severity: weightedHits > 3 ? 'critical' : evidence.length > 0 ? 'warning' : 'info',
+      files: [...new Set(evidence.map((e) => e.file))],
+      evidence,
     };
   },
 };
@@ -70,35 +114,66 @@ export const cacheUsageCheck: Check = {
   weight: 1,
 
   async run(context: ScanContext): Promise<Finding> {
+    const rules = mergePathRules(context.config.pathRules, PHP_LARAVEL_PATH_RULES);
+
     const phpFiles = context.files.filter(
       (f) => f.endsWith('.php') && !f.startsWith('vendor/'),
     );
 
-    let cacheUsage = 0;
+    const heavyQueryPattern =
+      /(?:->get\(\)|->all\(\)|->paginate\(|DB::select\(|DB::table\()/;
+    const cachePattern = /Cache::|cache\(\)|Redis::|->cache\(/;
+
+    let cacheUsageCount = 0;
+    const evidence: EvidenceItem[] = [];
 
     for (const file of phpFiles) {
+      const { weight, label } = classifyFile(file, rules);
+      if (weight === 0) continue;
+
       const content = readFile(context, file);
-      if (
-        content.includes('Cache::') ||
-        content.includes('cache()') ||
-        content.includes('Redis::') ||
-        content.includes('->cache(')
-      ) {
-        cacheUsage++;
+      if (!content) continue;
+
+      if (cachePattern.test(content)) {
+        cacheUsageCount++;
+        continue;
+      }
+
+      // No cache in this file — flag the first heavy query line as a candidate
+      const lines = content.split('\n');
+      for (let i = 0; i < lines.length; i++) {
+        if (heavyQueryPattern.test(lines[i])) {
+          evidence.push({
+            file,
+            line: i + 1,
+            snippet: snip(lines[i]),
+            weight,
+            label,
+          });
+          break;
+        }
       }
     }
 
-    // Presence of any cache usage is positive; we can't know if it's enough
-    const score = cacheUsage > 0 ? 80 : 40;
+    evidence.sort((a, b) => (b.weight ?? 1) - (a.weight ?? 1));
+
+    const score = cacheUsageCount > 0 ? 80 : 40;
+    const base =
+      cacheUsageCount > 0
+        ? `Cache usage found in ${cacheUsageCount} file(s)`
+        : 'No cache usage detected (Cache::, cache(), Redis::)';
 
     return {
-      message: cacheUsage > 0
-        ? `Cache usage found in ${cacheUsage} file(s)`
-        : 'No cache usage detected (Cache::, cache(), Redis::)',
+      message:
+        evidence.length > 0
+          ? `${base} — ${evidence.length} file(s) with heavy queries and no caching`
+          : base,
       score,
       maxScore: 80,
-      severity: cacheUsage === 0 ? 'info' : 'info',
-      detail: { filesWithCache: cacheUsage },
+      severity: cacheUsageCount === 0 && evidence.length > 0 ? 'warning' : 'info',
+      files: evidence.map((e) => e.file),
+      evidence,
+      detail: { filesWithCache: cacheUsageCount },
     };
   },
 };
@@ -112,25 +187,62 @@ export const eagerLoadingCheck: Check = {
   weight: 2,
 
   async run(context: ScanContext): Promise<Finding> {
+    const rules = mergePathRules(context.config.pathRules, PHP_LARAVEL_PATH_RULES);
+
     const phpFiles = context.files.filter(
       (f) => f.endsWith('.php') && !f.startsWith('vendor/'),
     );
 
+    const eagerPattern = /(?:->|::)with\s*\(/;
+    const relationLinePattern =
+      /\$this->(?:hasMany|hasOne|belongsTo|belongsToMany|morphTo|morphMany|hasManyThrough)\s*\(/;
+
     let withCount = 0;
     let relationCallCount = 0;
+    const evidence: EvidenceItem[] = [];
 
     for (const file of phpFiles) {
+      const { weight, label } = classifyFile(file, rules);
+      if (weight === 0) continue;
+
       const content = readFile(context, file);
-      withCount       += (content.match(/->with\s*\(/g) ?? []).length;
-      withCount       += (content.match(/::with\s*\(/g) ?? []).length;
-      relationCallCount += (content.match(/->(?:hasMany|hasOne|belongsTo|belongsToMany|morphTo|morphMany)\s*\(/g) ?? []).length;
+      if (!content) continue;
+
+      const fileWithCount =
+        (content.match(/->with\s*\(/g) ?? []).length +
+        (content.match(/::with\s*\(/g) ?? []).length;
+      withCount += fileWithCount;
+
+      const fileUsesEager = eagerPattern.test(content);
+      const lines = content.split('\n');
+
+      for (let i = 0; i < lines.length; i++) {
+        if (relationLinePattern.test(lines[i])) {
+          relationCallCount++;
+          if (!fileUsesEager) {
+            evidence.push({
+              file,
+              line: i + 1,
+              snippet: snip(lines[i]),
+              weight,
+              label,
+            });
+          }
+        }
+      }
     }
 
     if (relationCallCount === 0) {
-      return { message: 'No Eloquent relationships detected', score: 70, maxScore: 100, severity: 'info' };
+      return {
+        message: 'No Eloquent relationships detected',
+        score: 70,
+        maxScore: 100,
+        severity: 'info',
+      };
     }
 
-    // Relationships exist — check if eager loading is used at all
+    evidence.sort((a, b) => (b.weight ?? 1) - (a.weight ?? 1));
+
     const score = withCount > 0 ? Math.min(100, 60 + withCount * 5) : 30;
 
     return {
@@ -138,6 +250,8 @@ export const eagerLoadingCheck: Check = {
       score,
       maxScore: 100,
       severity: withCount === 0 && relationCallCount > 3 ? 'warning' : 'info',
+      files: [...new Set(evidence.map((e) => e.file))],
+      evidence: evidence.slice(0, 10),
       detail: { withCount, relationCallCount },
     };
   },

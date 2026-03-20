@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { Check, Dimension, Finding, ScanContext } from '../../../core/types.js';
+import { Check, Dimension, EvidenceItem, Finding, ScanContext } from '../../../core/types.js';
+import { classifyFile, mergePathRules, PHP_LARAVEL_PATH_RULES } from '../../../core/path-classifier.js';
 
 function readFile(context: ScanContext, rel: string): string {
   if (context.fileCache.has(rel)) return context.fileCache.get(rel)!;
@@ -11,6 +12,11 @@ function readFile(context: ScanContext, rel: string): string {
   } catch {
     return '';
   }
+}
+
+function snip(line: string, maxLen = 80): string {
+  const t = line.trim();
+  return t.length > maxLen ? t.slice(0, maxLen - 1) + '…' : t;
 }
 
 // ─── Check: Interface / contract usage ────────────────────────────────────────
@@ -30,8 +36,8 @@ export const interfaceUsageCheck: Check = {
 
     for (const file of phpFiles) {
       const content = readFile(context, file);
-      interfaceCount += (content.match(/^interface\s+/gm) ?? []).length;
-      classCount     += (content.match(/^class\s+/gm) ?? []).length;
+      interfaceCount  += (content.match(/^interface\s+/gm) ?? []).length;
+      classCount      += (content.match(/^class\s+/gm) ?? []).length;
       implementsCount += (content.match(/\bimplements\b/g) ?? []).length;
     }
 
@@ -69,7 +75,7 @@ export const repositoryPatternCheck: Check = {
 
     if (repos.length === 0) {
       return {
-        message: 'No repository pattern detected — data access is likely coupled to controllers/services',
+        message: 'No repository pattern detected — data access likely coupled to controllers/services',
         score: 40,
         maxScore: 80,
         severity: 'info',
@@ -95,25 +101,38 @@ export const configUsageCheck: Check = {
   weight: 1,
 
   async run(context: ScanContext): Promise<Finding> {
+    const rules = mergePathRules(context.config.pathRules, PHP_LARAVEL_PATH_RULES);
     const phpFiles = context.files.filter(
       (f) => f.endsWith('.php') && !f.startsWith('config/'),
     );
 
+    const urlPattern = /['"]https?:\/\/[^'"]{8,}['"]/;
+    const ipPattern  = /['"]\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}['"]/;
+
     let hardCodedUrls = 0;
-    let hardCodedIps = 0;
-    const offenders: string[] = [];
+    let hardCodedIps  = 0;
+    const evidence: EvidenceItem[] = [];
 
     for (const file of phpFiles) {
-      const content = readFile(context, file);
-      const urlMatches = (content.match(/['"]https?:\/\/[^'"]{8,}['"]/g) ?? []).length;
-      const ipMatches  = (content.match(/['"]\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}['"]/g) ?? []).length;
+      const { weight, label } = classifyFile(file, rules);
+      if (weight === 0) continue;
 
-      if (urlMatches + ipMatches > 0) {
-        hardCodedUrls += urlMatches;
-        hardCodedIps  += ipMatches;
-        offenders.push(file);
+      const content = readFile(context, file);
+      const lines = content.split('\n');
+
+      for (let i = 0; i < lines.length; i++) {
+        const hasUrl = urlPattern.test(lines[i]);
+        const hasIp  = ipPattern.test(lines[i]);
+
+        if (hasUrl || hasIp) {
+          if (hasUrl) hardCodedUrls++;
+          if (hasIp)  hardCodedIps++;
+          evidence.push({ file, line: i + 1, snippet: snip(lines[i]), weight, label });
+        }
       }
     }
+
+    evidence.sort((a, b) => (b.weight ?? 1) - (a.weight ?? 1));
 
     const total = hardCodedUrls + hardCodedIps;
     const score = Math.round(Math.max(0, 100 - total * 5));
@@ -123,7 +142,8 @@ export const configUsageCheck: Check = {
       score,
       maxScore: 100,
       severity: total > 5 ? 'warning' : 'info',
-      files: offenders.slice(0, 5),
+      files: [...new Set(evidence.map((e) => e.file))],
+      evidence: evidence.slice(0, 10),
       detail: { hardCodedUrls, hardCodedIps },
     };
   },

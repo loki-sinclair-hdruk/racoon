@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { Check, Dimension, Finding, ScanContext } from '../../../core/types.js';
+import { Check, Dimension, EvidenceItem, Finding, ScanContext } from '../../../core/types.js';
+import { classifyFile, mergePathRules, NEXTJS_REACT_PATH_RULES } from '../../../core/path-classifier.js';
 
 function readFile(context: ScanContext, rel: string): string {
   if (context.fileCache.has(rel)) return context.fileCache.get(rel)!;
@@ -13,9 +14,24 @@ function readFile(context: ScanContext, rel: string): string {
   }
 }
 
+function snip(line: string, maxLen = 80): string {
+  const t = line.trim();
+  return t.length > maxLen ? t.slice(0, maxLen - 1) + '…' : t;
+}
+
+/** Replace secret values in a line with [REDACTED] for safe display. */
+function redact(line: string): string {
+  return line
+    .replace(
+      /((?:apiKey|api_key|apikey|secret|password|passwd|token)\s*[:=]\s*)(['"`])[^'"`]{4,}(['"`])/gi,
+      '$1$2[REDACTED]$3',
+    )
+    .replace(/((?:sk-|pk_live_|pk_test_))[a-zA-Z0-9]{10,}/g, '$1[REDACTED]');
+}
+
 function jsFiles(context: ScanContext): string[] {
-  return context.files.filter((f) =>
-    f.match(/\.(js|jsx|ts|tsx)$/) && !f.includes('node_modules'),
+  return context.files.filter(
+    (f) => f.match(/\.(js|jsx|ts|tsx)$/) && !f.includes('node_modules'),
   );
 }
 
@@ -28,25 +44,36 @@ export const xssRiskCheck: Check = {
   weight: 4,
 
   async run(context: ScanContext): Promise<Finding> {
-    const hits: string[] = [];
+    const rules = mergePathRules(context.config.pathRules, NEXTJS_REACT_PATH_RULES);
+    const evidence: EvidenceItem[] = [];
 
     for (const file of jsFiles(context)) {
+      const { weight, label } = classifyFile(file, rules);
+      if (weight === 0) continue;
+
       const content = readFile(context, file);
-      if (content.includes('dangerouslySetInnerHTML')) {
-        hits.push(file);
+      const lines = content.split('\n');
+
+      for (let i = 0; i < lines.length; i++) {
+        if (lines[i].includes('dangerouslySetInnerHTML')) {
+          evidence.push({ file, line: i + 1, snippet: snip(lines[i]), weight, label });
+        }
       }
     }
 
-    const score = hits.length === 0 ? 100 : Math.max(0, 100 - hits.length * 20);
+    evidence.sort((a, b) => (b.weight ?? 1) - (a.weight ?? 1));
+
+    const score = evidence.length === 0 ? 100 : Math.max(0, 100 - evidence.length * 20);
 
     return {
-      message: hits.length === 0
+      message: evidence.length === 0
         ? 'No dangerouslySetInnerHTML usage found'
-        : `dangerouslySetInnerHTML used in ${hits.length} file(s)`,
+        : `dangerouslySetInnerHTML used in ${evidence.length} location(s)`,
       score,
       maxScore: 100,
-      severity: hits.length > 0 ? 'warning' : 'info',
-      files: hits.slice(0, 5),
+      severity: evidence.length > 0 ? 'warning' : 'info',
+      files: [...new Set(evidence.map((e) => e.file))],
+      evidence,
     };
   },
 };
@@ -60,25 +87,36 @@ export const evalUsageCheck: Check = {
   weight: 3,
 
   async run(context: ScanContext): Promise<Finding> {
-    const hits: string[] = [];
+    const rules = mergePathRules(context.config.pathRules, NEXTJS_REACT_PATH_RULES);
+    const evidence: EvidenceItem[] = [];
 
     for (const file of jsFiles(context)) {
+      const { weight, label } = classifyFile(file, rules);
+      if (weight === 0) continue;
+
       const content = readFile(context, file);
-      if (content.match(/\beval\s*\(/) || content.match(/new\s+Function\s*\(/)) {
-        hits.push(file);
+      const lines = content.split('\n');
+
+      for (let i = 0; i < lines.length; i++) {
+        if (lines[i].match(/\beval\s*\(/) || lines[i].match(/new\s+Function\s*\(/)) {
+          evidence.push({ file, line: i + 1, snippet: snip(lines[i]), weight, label });
+        }
       }
     }
 
-    const score = hits.length === 0 ? 100 : Math.max(0, 100 - hits.length * 30);
+    evidence.sort((a, b) => (b.weight ?? 1) - (a.weight ?? 1));
+
+    const score = evidence.length === 0 ? 100 : Math.max(0, 100 - evidence.length * 30);
 
     return {
-      message: hits.length === 0
+      message: evidence.length === 0
         ? 'No eval() or new Function() usage found'
-        : `eval()/Function() used in ${hits.length} file(s)`,
+        : `eval()/Function() used in ${evidence.length} location(s)`,
       score,
       maxScore: 100,
-      severity: hits.length > 0 ? 'critical' : 'info',
-      files: hits,
+      severity: evidence.length > 0 ? 'critical' : 'info',
+      files: [...new Set(evidence.map((e) => e.file))],
+      evidence,
     };
   },
 };
@@ -92,37 +130,53 @@ export const hardcodedSecretsCheck: Check = {
   weight: 4,
 
   async run(context: ScanContext): Promise<Finding> {
+    const rules = mergePathRules(context.config.pathRules, NEXTJS_REACT_PATH_RULES);
     const secretPatterns = [
-      /(?:apiKey|api_key|apikey)\s*[:=]\s*['"][a-zA-Z0-9_\-]{20,}['"]/g,
-      /(?:secret|password|passwd|token)\s*[:=]\s*['"][^'"]{8,}['"]/gi,
-      /(?:sk-|pk_live_|pk_test_)[a-zA-Z0-9]{20,}/g,
+      /(?:apiKey|api_key|apikey)\s*[:=]\s*['"`][a-zA-Z0-9_\-]{20,}['"`]/,
+      /(?:secret|password|passwd|token)\s*[:=]\s*['"`][^'"`]{8,}['"`]/i,
+      /(?:sk-|pk_live_|pk_test_)[a-zA-Z0-9]{20,}/,
     ];
 
-    const hits: string[] = [];
+    const evidence: EvidenceItem[] = [];
 
     for (const file of jsFiles(context)) {
-      // Skip .env files and config files
       if (file.match(/\.env/) || file.match(/\.config\.(js|ts|mjs|cjs)$/)) continue;
 
+      const { weight, label } = classifyFile(file, rules);
+      if (weight === 0) continue;
+
       const content = readFile(context, file);
-      for (const pattern of secretPatterns) {
-        if (pattern.test(content)) {
-          hits.push(file);
-          break;
+      const lines = content.split('\n');
+
+      for (let i = 0; i < lines.length; i++) {
+        for (const pattern of secretPatterns) {
+          if (pattern.test(lines[i])) {
+            evidence.push({
+              file,
+              line: i + 1,
+              snippet: snip(redact(lines[i])),
+              weight,
+              label,
+            });
+            break;
+          }
         }
       }
     }
 
-    const score = hits.length === 0 ? 100 : Math.max(0, 100 - hits.length * 25);
+    evidence.sort((a, b) => (b.weight ?? 1) - (a.weight ?? 1));
+
+    const score = evidence.length === 0 ? 100 : Math.max(0, 100 - evidence.length * 25);
 
     return {
-      message: hits.length === 0
+      message: evidence.length === 0
         ? 'No hardcoded secrets detected'
-        : `${hits.length} file(s) with potential hardcoded secrets`,
+        : `${evidence.length} potential hardcoded secret(s) found`,
       score,
       maxScore: 100,
-      severity: hits.length > 0 ? 'critical' : 'info',
-      files: hits.slice(0, 5),
+      severity: evidence.length > 0 ? 'critical' : 'info',
+      files: [...new Set(evidence.map((e) => e.file))],
+      evidence,
     };
   },
 };
@@ -145,14 +199,13 @@ export const securityHeadersCheck: Check = {
     }
 
     const content = readFile(context, nextConfigFile);
-
     const headers = {
-      csp:          content.includes('Content-Security-Policy'),
-      hsts:         content.includes('Strict-Transport-Security'),
-      xFrame:       content.includes('X-Frame-Options'),
-      xContent:     content.includes('X-Content-Type-Options'),
-      referrer:     content.includes('Referrer-Policy'),
-      hasHeaders:   content.includes('headers()') || content.includes("headers:"),
+      csp:        content.includes('Content-Security-Policy'),
+      hsts:       content.includes('Strict-Transport-Security'),
+      xFrame:     content.includes('X-Frame-Options'),
+      xContent:   content.includes('X-Content-Type-Options'),
+      referrer:   content.includes('Referrer-Policy'),
+      hasHeaders: content.includes('headers()') || content.includes('headers:'),
     };
 
     const definedCount = Object.values(headers).filter(Boolean).length;

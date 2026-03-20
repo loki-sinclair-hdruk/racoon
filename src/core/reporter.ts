@@ -1,6 +1,6 @@
 import chalk from 'chalk';
 import Table from 'cli-table3';
-import { Dimension, DimensionResult, ScanReport, Severity } from './types.js';
+import { DimensionResult, ScanReport } from './types.js';
 import { dimensionLabel, DIMENSIONS } from '../dimensions/index.js';
 
 export type OutputFormat = 'terminal' | 'json';
@@ -106,7 +106,7 @@ function reportTerminal(r: ScanReport): void {
   // Strengths
   if (r.strengths.length > 0) {
     console.log(chalk.bold.green('  What lifts your score'));
-    for (const { check, finding, dimension } of r.strengths) {
+    for (const { finding, dimension } of r.strengths) {
       const label = dimensionLabel(dimension);
       console.log(
         `  ${chalk.green('▲')} ${chalk.gray(`[${label}]`)} ${finding.message}`,
@@ -118,14 +118,27 @@ function reportTerminal(r: ScanReport): void {
   // Weaknesses / gaps
   if (r.weaknesses.length > 0) {
     console.log(chalk.bold.yellow('  Documented gaps — what holds you back'));
-    for (const { check, finding, dimension } of r.weaknesses) {
+    for (const { finding, dimension } of r.weaknesses) {
       const label = dimensionLabel(dimension);
       const gap = finding.maxScore - finding.score;
       const icon = finding.severity === 'critical' ? chalk.red('✖') : chalk.yellow('▼');
       console.log(
         `  ${icon} ${chalk.gray(`[${label}]`)} ${finding.message} ${chalk.gray(`(−${gap} pts)`)}`,
       );
-      if (finding.files && finding.files.length > 0) {
+      if (finding.evidence && finding.evidence.length > 0) {
+        const shown = finding.evidence.slice(0, 5);
+        for (const e of shown) {
+          const loc = chalk.cyan(`${e.file}:${e.line}`);
+          const labelTag = e.label ? chalk.magenta(`[${e.label}]`) + '  ' : '';
+          const weight = e.weight ?? 1;
+          const dim = weight < 1; // visually de-emphasise reduced-weight items
+          const code = dim ? chalk.gray(e.snippet) : chalk.white(e.snippet);
+          console.log(`     ${chalk.gray('↳')} ${loc}  ${labelTag}${code}`);
+        }
+        if (finding.evidence.length > 5) {
+          console.log(`     ${chalk.gray(`↳ +${finding.evidence.length - 5} more`)}`);
+        }
+      } else if (finding.files && finding.files.length > 0) {
         const shown = finding.files.slice(0, 3);
         console.log(
           `     ${chalk.gray('↳ ' + shown.join(', ') + (finding.files.length > 3 ? ` +${finding.files.length - 3} more` : ''))}`,

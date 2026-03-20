@@ -1,6 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { Check, Dimension, Finding, ScanContext } from '../../../core/types.js';
+import { Check, Dimension, EvidenceItem, Finding, ScanContext } from '../../../core/types.js';
 
 function readFile(context: ScanContext, rel: string): string {
   if (context.fileCache.has(rel)) return context.fileCache.get(rel)!;
@@ -13,6 +13,11 @@ function readFile(context: ScanContext, rel: string): string {
   }
 }
 
+function snip(line: string, maxLen = 80): string {
+  const t = line.trim();
+  return t.length > maxLen ? t.slice(0, maxLen - 1) + '…' : t;
+}
+
 // ─── Check: MVC structure adherence ──────────────────────────────────────────
 
 export const mvcStructureCheck: Check = {
@@ -23,11 +28,13 @@ export const mvcStructureCheck: Check = {
 
   async run(context: ScanContext): Promise<Finding> {
     const hasControllers = context.files.some((f) => f.match(/[Cc]ontrollers?\//));
-    const hasModels      = context.files.some((f) => f.match(/[Mm]odels?\//) || f.match(/app\/[A-Z][a-zA-Z]+\.php$/));
-    const hasViews       = context.files.some((f) =>
+    const hasModels      = context.files.some((f) =>
+      f.match(/[Mm]odels?\//) || f.match(/app\/[A-Z][a-zA-Z]+\.php$/),
+    );
+    const hasViews = context.files.some((f) =>
       f.match(/resources\/views\//) || f.match(/views\/.*\.blade\.php/),
     );
-    const hasRoutes      = context.files.some((f) =>
+    const hasRoutes = context.files.some((f) =>
       f.match(/routes\/.*\.php$/) || f === 'routes/web.php' || f === 'routes/api.php',
     );
 
@@ -65,7 +72,6 @@ export const middlewareCheck: Check = {
       f.match(/[Mm]iddleware\/.*\.php$/),
     );
 
-    // Check if routes use middleware
     const routeFiles = context.files.filter((f) => f.match(/^routes\//));
     let routesUseMiddleware = false;
 
@@ -85,7 +91,7 @@ export const middlewareCheck: Check = {
       message: `${middlewareFiles.length} middleware class(es) — route middleware: ${routesUseMiddleware ? 'yes' : 'not detected'}`,
       score,
       maxScore: 100,
-      severity: middlewareFiles.length === 0 ? 'info' : 'info',
+      severity: 'info',
       detail: { middlewareFiles: middlewareFiles.length, routesUseMiddleware },
     };
   },
@@ -108,21 +114,31 @@ export const separationOfConcernsCheck: Check = {
       return { message: 'No controllers found', score: 70, maxScore: 100, severity: 'info' };
     }
 
+    const dbCallPattern = /DB::|->where\(|->create\(|->update\(|->delete\(/g;
+    const evidence: EvidenceItem[] = [];
     let heavyControllers = 0;
-    const offenders: string[] = [];
 
     for (const file of controllerFiles) {
       const content = readFile(context, file);
+      const dbCalls = (content.match(dbCallPattern) ?? []).length;
 
-      // Signs of business logic in controllers
-      const dbCalls    = (content.match(/DB::|->where\(|->create\(|->update\(|->delete\(/g) ?? []).length;
-      const mailCalls  = (content.match(/Mail::|->send\(|->queue\(/g) ?? []).length;
-      const dispatchCalls = (content.match(/dispatch\(|->dispatch\(/g) ?? []).length;
-
-      // A controller doing many DB calls directly (without a service) is a smell
       if (dbCalls > 10) {
         heavyControllers++;
-        offenders.push(`${file} (${dbCalls} direct DB calls)`);
+
+        // Find and record the first direct DB call line as evidence anchor
+        const lines = content.split('\n');
+        for (let i = 0; i < lines.length; i++) {
+          if (/DB::|->where\(|->create\(|->update\(|->delete\(/.test(lines[i])) {
+            evidence.push({
+              file,
+              line: i + 1,
+              snippet: `${snip(lines[i])}  [${dbCalls} total DB calls in file]`,
+              weight: 1.5,
+              label: 'controller',
+            });
+            break;
+          }
+        }
       }
     }
 
@@ -134,7 +150,8 @@ export const separationOfConcernsCheck: Check = {
       score,
       maxScore: 100,
       severity: ratio > 0.4 ? 'critical' : ratio > 0.2 ? 'warning' : 'info',
-      files: offenders.slice(0, 5),
+      files: evidence.map((e) => e.file),
+      evidence,
     };
   },
 };

@@ -49,6 +49,24 @@ export interface ScanContext {
 
 export type Severity = 'info' | 'warning' | 'critical';
 
+/** A pinpointed source location with the relevant code snippet. */
+export interface EvidenceItem {
+  /** Relative path from project root. */
+  file: string;
+  /** 1-based line number. */
+  line: number;
+  /** The offending source line, trimmed to ≤80 chars. */
+  snippet: string;
+  /**
+   * Path classification weight (from PathRule).
+   * 0 = excluded, <1 = reduced, 1 = normal, >1 = high-impact.
+   * Omitted means weight was 1 (normal).
+   */
+  weight?: number;
+  /** Human-readable path label, e.g. "controller", "service". */
+  label?: string;
+}
+
 export interface Finding {
   /** Human-readable description of what was found. */
   message: string;
@@ -59,6 +77,8 @@ export interface Finding {
   severity: Severity;
   /** File path(s) most relevant to this finding, relative to project root. */
   files?: string[];
+  /** Pinpointed source locations — shown in gap output and verbose mode. */
+  evidence?: EvidenceItem[];
   /** Additional structured detail for verbose/JSON output. */
   detail?: Record<string, unknown>;
 }
@@ -132,4 +152,10 @@ export interface RacoonConfig {
   skip?: string[];
   /** Output format when not overridden by CLI flag. */
   outputFormat?: 'terminal' | 'json';
+  /**
+   * Custom path classification rules, prepended to the default rule set.
+   * Rules are evaluated top-to-bottom; first match wins.
+   * weight 0 = excluded, <1 = reduced, 1 = normal, >1 = high-impact.
+   */
+  pathRules?: import('./path-classifier.js').PathRule[];
 }

@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { Check, Dimension, Finding, ScanContext } from '../../../core/types.js';
+import { Check, Dimension, EvidenceItem, Finding, ScanContext } from '../../../core/types.js';
+import { classifyFile, mergePathRules, NEXTJS_REACT_PATH_RULES } from '../../../core/path-classifier.js';
 
 function readFile(context: ScanContext, rel: string): string {
   if (context.fileCache.has(rel)) return context.fileCache.get(rel)!;
@@ -13,6 +14,11 @@ function readFile(context: ScanContext, rel: string): string {
   }
 }
 
+function snip(line: string, maxLen = 80): string {
+  const t = line.trim();
+  return t.length > maxLen ? t.slice(0, maxLen - 1) + '…' : t;
+}
+
 // ─── Check: TypeScript usage ──────────────────────────────────────────────────
 
 export const typescriptCheck: Check = {
@@ -23,8 +29,12 @@ export const typescriptCheck: Check = {
 
   async run(context: ScanContext): Promise<Finding> {
     const hasTsConfig = context.files.includes('tsconfig.json');
-    const tsFiles = context.files.filter((f) => f.match(/\.(ts|tsx)$/) && !f.includes('node_modules'));
-    const jsFiles = context.files.filter((f) => f.match(/\.(js|jsx)$/) && !f.includes('node_modules') && !f.match(/\.config\.(js|cjs|mjs)$/));
+    const tsFiles = context.files.filter(
+      (f) => f.match(/\.(ts|tsx)$/) && !f.includes('node_modules'),
+    );
+    const jsFiles = context.files.filter(
+      (f) => f.match(/\.(js|jsx)$/) && !f.includes('node_modules') && !f.match(/\.config\.(js|cjs|mjs)$/),
+    );
 
     if (!hasTsConfig && tsFiles.length === 0) {
       return {
@@ -58,13 +68,11 @@ export const customHookCheck: Check = {
   weight: 1,
 
   async run(context: ScanContext): Promise<Finding> {
-    const hookFiles = context.files.filter((f) =>
-      f.match(/use[A-Z][a-zA-Z]+\.(ts|tsx|js|jsx)$/) &&
-      !f.includes('node_modules'),
+    const hookFiles = context.files.filter(
+      (f) => f.match(/use[A-Z][a-zA-Z]+\.(ts|tsx|js|jsx)$/) && !f.includes('node_modules'),
     );
-
-    const componentFiles = context.files.filter((f) =>
-      f.match(/\.(jsx|tsx)$/) && !f.includes('node_modules'),
+    const componentFiles = context.files.filter(
+      (f) => f.match(/\.(jsx|tsx)$/) && !f.includes('node_modules'),
     );
 
     if (componentFiles.length === 0) {
@@ -78,7 +86,7 @@ export const customHookCheck: Check = {
       message: `${hookFiles.length} custom hook file(s) for ${componentFiles.length} components`,
       score,
       maxScore: 80,
-      severity: hookFiles.length === 0 && componentFiles.length > 5 ? 'info' : 'info',
+      severity: 'info',
       detail: { hookFiles: hookFiles.length, componentFiles: componentFiles.length },
     };
   },
@@ -93,8 +101,9 @@ export const propTypesCheck: Check = {
   weight: 2,
 
   async run(context: ScanContext): Promise<Finding> {
-    const componentFiles = context.files.filter((f) =>
-      f.match(/\.(jsx|tsx)$/) && !f.includes('node_modules'),
+    const rules = mergePathRules(context.config.pathRules, NEXTJS_REACT_PATH_RULES);
+    const componentFiles = context.files.filter(
+      (f) => f.match(/\.(jsx|tsx)$/) && !f.includes('node_modules'),
     );
 
     if (componentFiles.length === 0) {
@@ -102,12 +111,15 @@ export const propTypesCheck: Check = {
     }
 
     let typedComponents = 0;
-    let untyped: string[] = [];
+    const evidence: EvidenceItem[] = [];
 
     for (const file of componentFiles) {
-      const content = readFile(context, file);
+      const { weight, label } = classifyFile(file, rules);
+      if (weight === 0) continue;
 
-      // TypeScript interface/type for props
+      const content = readFile(context, file);
+      const lines = content.split('\n');
+
       const hasTypeProps =
         content.match(/(?:interface|type)\s+\w*[Pp]rops\w*\s*[={<]/) ||
         content.match(/React\.FC</) ||
@@ -118,13 +130,24 @@ export const propTypesCheck: Check = {
         typedComponents++;
       } else {
         // Only flag files that actually export a component
-        if (content.match(/export\s+(?:default\s+)?(?:function|const)\s+[A-Z]/)) {
-          untyped.push(file);
+        const exportIdx = lines.findIndex((l) =>
+          l.match(/export\s+(?:default\s+)?(?:function|const)\s+[A-Z]/),
+        );
+        if (exportIdx >= 0) {
+          evidence.push({
+            file,
+            line: exportIdx + 1,
+            snippet: snip(lines[exportIdx]),
+            weight,
+            label,
+          });
         }
       }
     }
 
-    const exportedComponents = typedComponents + untyped.length;
+    evidence.sort((a, b) => (b.weight ?? 1) - (a.weight ?? 1));
+
+    const exportedComponents = typedComponents + evidence.length;
     if (exportedComponents === 0) {
       return { message: 'No exported components found', score: 50, maxScore: 100, severity: 'info' };
     }
@@ -137,7 +160,8 @@ export const propTypesCheck: Check = {
       score,
       maxScore: 100,
       severity: ratio < 0.5 ? 'warning' : 'info',
-      files: untyped.slice(0, 5),
+      files: [...new Set(evidence.map((e) => e.file))],
+      evidence: evidence.slice(0, 10),
     };
   },
 };

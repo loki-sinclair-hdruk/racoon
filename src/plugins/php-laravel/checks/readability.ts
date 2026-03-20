@@ -1,8 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { Check, Dimension, Finding, ScanContext } from '../../../core/types.js';
-
-// ─── Helper ───────────────────────────────────────────────────────────────────
+import { Check, Dimension, EvidenceItem, Finding, ScanContext } from '../../../core/types.js';
+import { classifyFile, mergePathRules, PHP_LARAVEL_PATH_RULES } from '../../../core/path-classifier.js';
 
 function readFile(context: ScanContext, rel: string): string {
   if (context.fileCache.has(rel)) return context.fileCache.get(rel)!;
@@ -15,8 +14,9 @@ function readFile(context: ScanContext, rel: string): string {
   }
 }
 
-function phpFiles(context: ScanContext): string[] {
-  return context.files.filter((f) => f.endsWith('.php'));
+function snip(line: string, maxLen = 80): string {
+  const t = line.trim();
+  return t.length > maxLen ? t.slice(0, maxLen - 1) + '…' : t;
 }
 
 // ─── Check: Method length ─────────────────────────────────────────────────────
@@ -28,33 +28,37 @@ export const methodLengthCheck: Check = {
   weight: 2,
 
   async run(context: ScanContext): Promise<Finding> {
-    const files = phpFiles(context);
-    if (files.length === 0) {
+    const rules = mergePathRules(context.config.pathRules, PHP_LARAVEL_PATH_RULES);
+    const phpFiles = context.files.filter((f) => f.endsWith('.php'));
+
+    if (phpFiles.length === 0) {
       return { message: 'No PHP files found', score: 50, maxScore: 100, severity: 'info' };
     }
 
-    const longMethods: string[] = [];
+    const evidence: EvidenceItem[] = [];
     let totalMethods = 0;
 
-    for (const file of files) {
+    for (const file of phpFiles) {
+      const { weight, label } = classifyFile(file, rules);
+      if (weight === 0) continue;
+
       const content = readFile(context, file);
       const lines = content.split('\n');
 
       let inMethod = false;
       let methodStart = 0;
       let braceDepth = 0;
-      let methodName = '';
+      let signatureLine = '';
 
       for (let i = 0; i < lines.length; i++) {
         const line = lines[i];
-
-        // Detect method declaration
         const methodMatch = line.match(/^\s+(?:public|protected|private|static)\s+function\s+(\w+)/);
+
         if (methodMatch && !inMethod) {
           inMethod = true;
           methodStart = i;
           braceDepth = 0;
-          methodName = methodMatch[1];
+          signatureLine = line;
         }
 
         if (inMethod) {
@@ -65,7 +69,13 @@ export const methodLengthCheck: Check = {
             totalMethods++;
             const length = i - methodStart;
             if (length > 30) {
-              longMethods.push(`${file}:${methodStart + 1} (${methodName}, ${length} lines)`);
+              evidence.push({
+                file,
+                line: methodStart + 1,
+                snippet: `${snip(signatureLine)}  [${length} lines]`,
+                weight,
+                label,
+              });
             }
             inMethod = false;
           }
@@ -77,16 +87,19 @@ export const methodLengthCheck: Check = {
       return { message: 'No methods found to analyse', score: 50, maxScore: 100, severity: 'info' };
     }
 
-    const ratio = longMethods.length / totalMethods;
+    evidence.sort((a, b) => (b.weight ?? 1) - (a.weight ?? 1));
+
+    const ratio = evidence.length / totalMethods;
     const score = Math.round(Math.max(0, 100 - ratio * 200));
 
     return {
-      message: `${longMethods.length}/${totalMethods} methods exceed 30 lines`,
+      message: `${evidence.length}/${totalMethods} methods exceed 30 lines`,
       score,
       maxScore: 100,
       severity: ratio > 0.3 ? 'warning' : 'info',
-      files: longMethods.slice(0, 10),
-      detail: { longMethodCount: longMethods.length, totalMethods },
+      files: [...new Set(evidence.map((e) => e.file))],
+      evidence: evidence.slice(0, 10),
+      detail: { longMethodCount: evidence.length, totalMethods },
     };
   },
 };
@@ -100,8 +113,10 @@ export const namingConventionsCheck: Check = {
   weight: 1,
 
   async run(context: ScanContext): Promise<Finding> {
-    const files = phpFiles(context);
-    if (files.length === 0) {
+    const rules = mergePathRules(context.config.pathRules, PHP_LARAVEL_PATH_RULES);
+    const phpFiles = context.files.filter((f) => f.endsWith('.php'));
+
+    if (phpFiles.length === 0) {
       return { message: 'No PHP files found', score: 50, maxScore: 100, severity: 'info' };
     }
 
@@ -109,22 +124,41 @@ export const namingConventionsCheck: Check = {
     let badClasses = 0;
     let methodCount = 0;
     let badMethods = 0;
+    const evidence: EvidenceItem[] = [];
 
-    for (const file of files) {
+    for (const file of phpFiles) {
+      const { weight, label } = classifyFile(file, rules);
+      if (weight === 0) continue;
+
       const content = readFile(context, file);
+      const lines = content.split('\n');
 
-      // Classes should be PascalCase
-      for (const match of content.matchAll(/^class\s+(\w+)/gm)) {
-        classCount++;
-        if (!/^[A-Z][A-Za-z0-9]*$/.test(match[1])) badClasses++;
-      }
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
 
-      // Methods should be camelCase
-      for (const match of content.matchAll(/function\s+([a-zA-Z_]\w*)\s*\(/g)) {
-        const name = match[1];
-        if (name.startsWith('__')) continue; // magic methods
-        methodCount++;
-        if (!/^[a-z][a-zA-Z0-9]*$/.test(name)) badMethods++;
+        const classMatch = line.match(/^class\s+(\w+)/);
+        if (classMatch) {
+          classCount++;
+          if (!/^[A-Z][A-Za-z0-9]*$/.test(classMatch[1])) {
+            badClasses++;
+            if (evidence.length < 15) {
+              evidence.push({ file, line: i + 1, snippet: snip(line), weight, label });
+            }
+          }
+        }
+
+        const methodMatches = [...line.matchAll(/function\s+([a-zA-Z_]\w*)\s*\(/g)];
+        for (const m of methodMatches) {
+          const name = m[1];
+          if (name.startsWith('__')) continue;
+          methodCount++;
+          if (!/^[a-z][a-zA-Z0-9]*$/.test(name)) {
+            badMethods++;
+            if (evidence.length < 15) {
+              evidence.push({ file, line: i + 1, snippet: snip(line), weight, label });
+            }
+          }
+        }
       }
     }
 
@@ -132,6 +166,8 @@ export const namingConventionsCheck: Check = {
     if (total === 0) {
       return { message: 'No classes or methods found', score: 50, maxScore: 100, severity: 'info' };
     }
+
+    evidence.sort((a, b) => (b.weight ?? 1) - (a.weight ?? 1));
 
     const bad = badClasses + badMethods;
     const score = Math.round(Math.max(0, 100 - (bad / total) * 150));
@@ -141,6 +177,8 @@ export const namingConventionsCheck: Check = {
       score,
       maxScore: 100,
       severity: bad > 5 ? 'warning' : 'info',
+      files: [...new Set(evidence.map((e) => e.file))],
+      evidence,
       detail: { badClasses, badMethods, classCount, methodCount },
     };
   },
