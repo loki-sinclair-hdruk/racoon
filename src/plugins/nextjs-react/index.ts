@@ -4,7 +4,7 @@ import { PluginRegistry } from '../../core/registry.js';
 import { eslintConfigCheck, componentSizeCheck }             from './checks/readability.js';
 import { typescriptCheck, customHookCheck, propTypesCheck }  from './checks/maintainability.js';
 import { fileStructureCheck, envVarUsageCheck, apiAbstractionCheck } from './checks/extensibility.js';
-import { testFrameworkCheck, testFileRatioCheck, coverageConfigCheck } from './checks/test-coverage.js';
+import { testFrameworkCheck, testFileRatioCheck, assertionDensityCheck, coverageConfigCheck } from './checks/test-coverage.js';
 import { xssRiskCheck, evalUsageCheck, hardcodedSecretsCheck, securityHeadersCheck } from './checks/security.js';
 import { nextImageCheck, codeSplittingCheck, memoizationCheck } from './checks/performance.js';
 import { readmeCheck, jsDocCheck, storybookCheck }            from './checks/documentation.js';
@@ -28,6 +28,7 @@ const nextjsReactPlugin: Plugin = {
     // Test Coverage
     testFrameworkCheck,
     testFileRatioCheck,
+    assertionDensityCheck,
     coverageConfigCheck,
     // Security
     xssRiskCheck,

@@ -74,7 +74,12 @@ program
       // CI/CD exit code support
       if (opts.failUnder !== undefined) {
         const threshold = parseInt(opts.failUnder as string, 10);
+        if (isNaN(threshold) || threshold < 0 || threshold > 100) {
+          console.error(`Error: --fail-under must be a number between 0 and 100`);
+          process.exit(1);
+        }
         if (result.overallScore < threshold) {
+          console.error(`Quality gate failed: score ${result.overallScore} is below threshold ${threshold}`);
           process.exit(1);
         }
       }

@@ -2,6 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { Check, Dimension, EvidenceItem, Finding, ScanContext } from '../../../core/types.js';
 import { classifyFile, mergePathRules, PHP_LARAVEL_PATH_RULES } from '../../../core/path-classifier.js';
+import { readSanitizedFile } from '../../../core/sanitizer.js';
 
 function readFile(context: ScanContext, rel: string): string {
   if (context.fileCache.has(rel)) return context.fileCache.get(rel)!;
@@ -20,6 +21,33 @@ function snip(line: string, maxLen = 80): string {
 }
 
 // ─── Check: Controller bloat ──────────────────────────────────────────────────
+// Flags individual controller *methods* whose code-line count (comments and
+// Swagger/PHPDoc annotations stripped) exceeds FAT_METHOD_THRESHOLD.
+// A controller can be large if it has many small, focused actions; the real
+// smell is a single method doing too much — it implies business logic has
+// leaked into the controller layer.
+
+const FAT_METHOD_THRESHOLD = 30;
+
+/**
+ * Count non-blank sanitized lines inside a method body starting at startIdx.
+ * Tracks brace depth to know when the method ends.
+ */
+function countMethodCodeLines(safeLines: string[], startIdx: number): number {
+  let depth = 0;
+  let codeLines = 0;
+  let started = false;
+
+  for (let i = startIdx; i < Math.min(startIdx + 300, safeLines.length); i++) {
+    for (const ch of safeLines[i]) {
+      if (ch === '{') { depth++; started = true; }
+      else if (ch === '}') { depth--; }
+    }
+    if (started && safeLines[i].trim().length > 0) codeLines++;
+    if (started && depth === 0) break;
+  }
+  return codeLines;
+}
 
 export const controllerBloatCheck: Check = {
   id: 'php-laravel/controller-bloat',
@@ -37,46 +65,53 @@ export const controllerBloatCheck: Check = {
     }
 
     const evidence: EvidenceItem[] = [];
-    let totalLines = 0;
+    let totalMethods = 0;
 
     for (const file of controllers) {
-      const content = readFile(context, file);
-      const lines = content.split('\n');
-      totalLines += lines.length;
+      const origLines = readFile(context, file).split('\n');
+      const safeLines = readSanitizedFile(context, file).split('\n');
 
-      if (lines.length > 200) {
-        // Find the class declaration line for the evidence anchor
-        const classLineIdx = lines.findIndex((l) => l.match(/^class\s+\w+/));
-        const anchorIdx = classLineIdx >= 0 ? classLineIdx : 0;
-        evidence.push({
-          file,
-          line: anchorIdx + 1,
-          snippet: `${snip(lines[anchorIdx])}  [${lines.length} lines]`,
-          weight: 1.5,
-          label: 'controller',
-        });
+      for (let i = 0; i < origLines.length; i++) {
+        if (!origLines[i].match(/(?:public|protected|private|static|\s)+function\s+\w+\s*\(/)) continue;
+
+        totalMethods++;
+        const codeLines = countMethodCodeLines(safeLines, i);
+
+        if (codeLines > FAT_METHOD_THRESHOLD) {
+          evidence.push({
+            file,
+            line: i + 1,
+            snippet: `${snip(origLines[i])}  [${codeLines} code lines]`,
+            weight: 1.5,
+            label: 'controller',
+          });
+        }
       }
     }
 
+    if (totalMethods === 0) {
+      return { message: 'No controller methods found', score: 70, maxScore: 100, severity: 'info' };
+    }
+
     evidence.sort((a, b) => {
-      // Sort by line count descending (encoded in snippet)
-      const aLines = parseInt(a.snippet.match(/\[(\d+) lines\]/)?.[1] ?? '0', 10);
-      const bLines = parseInt(b.snippet.match(/\[(\d+) lines\]/)?.[1] ?? '0', 10);
-      return bLines - aLines;
+      const aL = parseInt(a.snippet.match(/\[(\d+) code lines\]/)?.[1] ?? '0', 10);
+      const bL = parseInt(b.snippet.match(/\[(\d+) code lines\]/)?.[1] ?? '0', 10);
+      return bL - aL;
     });
 
-    const avgLines = Math.round(totalLines / controllers.length);
-    const ratio = evidence.length / controllers.length;
-    const score = Math.round(Math.max(0, 100 - ratio * 150 - Math.max(0, avgLines - 100) * 0.2));
+    const ratio = evidence.length / totalMethods;
+    const score = Math.round(Math.max(0, 100 - ratio * 200));
 
     return {
-      message: `${evidence.length}/${controllers.length} controllers exceed 200 lines (avg ${avgLines})`,
+      message: evidence.length === 0
+        ? `${controllers.length} controller(s) — all methods within acceptable size`
+        : `${evidence.length}/${totalMethods} controller method(s) exceed ${FAT_METHOD_THRESHOLD} code lines — likely contain business logic`,
       score,
       maxScore: 100,
-      severity: ratio > 0.4 ? 'critical' : ratio > 0.2 ? 'warning' : 'info',
-      files: evidence.map((e) => e.file),
+      severity: ratio > 0.3 ? 'critical' : ratio > 0.1 ? 'warning' : 'info',
+      files: [...new Set(evidence.map((e) => e.file))],
       evidence,
-      detail: { bloatedCount: evidence.length, total: controllers.length, avgLines },
+      detail: { fatMethods: evidence.length, totalMethods },
     };
   },
 };

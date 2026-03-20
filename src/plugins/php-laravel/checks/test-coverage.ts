@@ -1,6 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { Check, Dimension, Finding, ScanContext } from '../../../core/types.js';
+import { Check, Dimension, EvidenceItem, Finding, ScanContext } from '../../../core/types.js';
 
 function readFile(context: ScanContext, rel: string): string {
   if (context.fileCache.has(rel)) return context.fileCache.get(rel)!;
@@ -44,53 +44,124 @@ export const testFrameworkCheck: Check = {
   },
 };
 
-// ─── Check: Test file ratio ───────────────────────────────────────────────────
+// ─── Check: Critical-path test coverage ──────────────────────────────────────
+// Rather than a naive file-count ratio, score on whether high-weight files
+// (controllers, services, repositories, jobs, listeners, middleware) have a
+// corresponding test file.  Cap maxScore at 80 — file existence alone cannot
+// prove quality.
+
+const CRITICAL_PATH_PATTERNS = [
+  /Controllers?\//,
+  /Services?\//,
+  /Repositories?\//,
+  /Jobs?\//,
+  /Listeners?\//,
+  /Middleware\//,
+];
 
 export const testFileRatioCheck: Check = {
   id: 'php-laravel/test-file-ratio',
-  name: 'Test File Ratio',
+  name: 'Critical Path Test Coverage',
   dimension: Dimension.TestCoverage,
   weight: 3,
 
   async run(context: ScanContext): Promise<Finding> {
-    const sourceFiles = context.files.filter(
-      (f) =>
-        f.endsWith('.php') &&
-        !f.startsWith('tests/') &&
-        !f.startsWith('Tests/') &&
-        !f.endsWith('Test.php') &&
-        !f.endsWith('Spec.php'),
-    );
-
     const testFiles = context.files.filter(
       (f) =>
         f.endsWith('.php') &&
         (f.startsWith('tests/') || f.startsWith('Tests/') || f.endsWith('Test.php') || f.endsWith('Spec.php')),
     );
 
-    if (sourceFiles.length === 0) {
-      return { message: 'No source PHP files found', score: 50, maxScore: 100, severity: 'info' };
+    const criticalFiles = context.files.filter(
+      (f) =>
+        f.endsWith('.php') &&
+        !f.startsWith('tests/') &&
+        !f.startsWith('Tests/') &&
+        CRITICAL_PATH_PATTERNS.some((p) => p.test(f)),
+    );
+
+    if (criticalFiles.length === 0) {
+      return { message: 'No critical-path source files found', score: 50, maxScore: 80, severity: 'info' };
     }
 
-    if (testFiles.length === 0) {
-      return {
-        message: `0 test files for ${sourceFiles.length} source files`,
-        score: 0,
-        maxScore: 100,
-        severity: 'critical',
-      };
+    // Match by base name: UserController.php → UserControllerTest.php / UserControllerSpec.php
+    const testBaseNames = new Set(
+      testFiles.map((f) => path.basename(f).replace(/(Test|Spec)\.php$/, '').toLowerCase()),
+    );
+
+    const uncovered: EvidenceItem[] = [];
+    let covered = 0;
+
+    for (const src of criticalFiles) {
+      const base = path.basename(src, '.php').toLowerCase();
+      if (testBaseNames.has(base)) {
+        covered++;
+      } else {
+        uncovered.push({ file: src, line: 1, snippet: `no test found for ${path.basename(src)}` });
+      }
     }
 
-    const ratio = testFiles.length / sourceFiles.length;
-    // Ideal is 1:1; score linearly up to that
-    const score = Math.min(100, Math.round(ratio * 100));
+    const ratio = covered / criticalFiles.length;
+    const score = Math.min(80, Math.round(ratio * 80));
 
     return {
-      message: `${testFiles.length} test files for ${sourceFiles.length} source files (${Math.round(ratio * 100)}% ratio)`,
+      message: `${covered}/${criticalFiles.length} critical-path files have tests (${Math.round(ratio * 100)}%)`,
+      score,
+      maxScore: 80,
+      severity: ratio < 0.3 ? 'critical' : ratio < 0.6 ? 'warning' : 'info',
+      evidence: uncovered.slice(0, 10),
+      detail: { covered, total: criticalFiles.length },
+    };
+  },
+};
+
+// ─── Check: Test assertion density ───────────────────────────────────────────
+// Counts assertions per test file (PHPUnit + Pest patterns).  A low average
+// signals placeholder / smoke tests that don't meaningfully exercise behaviour.
+
+const PHP_ASSERTION_RE = /->assert[A-Za-z]+\s*\(|\bexpect\s*\(|\bassertSame\b|\bassertEquals\b|\bassertTrue\b|\bassertFalse\b|\bassertCount\b|\bassertContains\b/g;
+
+export const assertionDensityCheck: Check = {
+  id: 'php-laravel/assertion-density',
+  name: 'Test Assertion Density',
+  dimension: Dimension.TestCoverage,
+  weight: 2,
+
+  async run(context: ScanContext): Promise<Finding> {
+    const testFiles = context.files.filter(
+      (f) =>
+        f.endsWith('.php') &&
+        (f.startsWith('tests/') || f.startsWith('Tests/') || f.endsWith('Test.php') || f.endsWith('Spec.php')),
+    );
+
+    if (testFiles.length === 0) {
+      return { message: 'No test files to analyse', score: 0, maxScore: 100, severity: 'critical' };
+    }
+
+    const sparse: EvidenceItem[] = [];
+    let totalAssertions = 0;
+
+    for (const f of testFiles) {
+      const content = readFile(context, f);
+      const count = (content.match(PHP_ASSERTION_RE) ?? []).length;
+      totalAssertions += count;
+      if (count === 0) {
+        sparse.push({ file: f, line: 1, snippet: 'no assertions found — may be a smoke test or placeholder' });
+      }
+    }
+
+    const avg = totalAssertions / testFiles.length;
+    const score =
+      avg >= 7 ? 100 :
+      avg >= 3 ? 80  :
+      avg >= 1 ? 50  : 20;
+
+    return {
+      message: `avg ${avg.toFixed(1)} assertions/file (${totalAssertions} total across ${testFiles.length} test files)`,
       score,
       maxScore: 100,
-      severity: ratio < 0.2 ? 'critical' : ratio < 0.5 ? 'warning' : 'info',
-      detail: { testFiles: testFiles.length, sourceFiles: sourceFiles.length, ratio },
+      severity: avg < 1 ? 'critical' : avg < 3 ? 'warning' : 'info',
+      evidence: sparse.slice(0, 8),
     };
   },
 };

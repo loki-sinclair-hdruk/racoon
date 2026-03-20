@@ -4,7 +4,7 @@ import { PluginRegistry } from '../../core/registry.js';
 import { methodLengthCheck, namingConventionsCheck }         from './checks/readability.js';
 import { controllerBloatCheck, serviceLayerCheck, cyclomaticComplexityCheck } from './checks/maintainability.js';
 import { interfaceUsageCheck, repositoryPatternCheck, configUsageCheck }      from './checks/extensibility.js';
-import { testFrameworkCheck, testFileRatioCheck, testTypeBalanceCheck }        from './checks/test-coverage.js';
+import { testFrameworkCheck, testFileRatioCheck, assertionDensityCheck, testTypeBalanceCheck } from './checks/test-coverage.js';
 import { hardcodedSecretsCheck, sqlInjectionCheck, envExposureCheck, massAssignmentCheck } from './checks/security.js';
 import { nPlusOneCheck, cacheUsageCheck, eagerLoadingCheck }                  from './checks/performance.js';
 import { readmeCheck, phpDocCoverageCheck, changelogCheck }                   from './checks/documentation.js';
@@ -28,6 +28,7 @@ const phpLaravelPlugin: Plugin = {
     // Test Coverage
     testFrameworkCheck,
     testFileRatioCheck,
+    assertionDensityCheck,
     testTypeBalanceCheck,
     // Security
     hardcodedSecretsCheck,

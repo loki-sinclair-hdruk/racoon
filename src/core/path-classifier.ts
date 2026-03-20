@@ -98,7 +98,9 @@ export const NEXTJS_REACT_PATH_RULES: PathRule[] = [
  * @param rules     Ordered rule list — first match wins.
  */
 export function classifyFile(filePath: string, rules: PathRule[]): FileClassification {
-  const normalised = filePath.replace(/\\/g, '/');
+  // Prepend '/' so that top-level dirs like 'tests/Feature/...' match
+  // patterns written as '/tests/' (i.e. the path always starts with a slash).
+  const normalised = ('/' + filePath.replace(/\\/g, '/')).replace('//', '/');
   for (const rule of rules) {
     if (normalised.includes(rule.pattern)) {
       return { weight: rule.weight, label: rule.label };

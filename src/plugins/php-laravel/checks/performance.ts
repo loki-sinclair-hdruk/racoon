@@ -45,10 +45,22 @@ export const nPlusOneCheck: Check = {
       (f) => f.endsWith('.php') && !f.startsWith('vendor/'),
     );
 
+    // Genuine DB query methods on an Eloquent builder/model instance inside a loop.
+    // 'all' removed: ->all() is more commonly called on Requests/Collections and
+    // produces too many false positives vs the rare true N+1 it detects.
     const queryPattern =
-      /->(?:find|where|whereIn|first|firstOrFail|get|all|count|sum|pluck)\s*\(/;
+      /->(?:find|where|whereIn|first|firstOrFail|get|count|sum|pluck)\s*\(/;
     const dbFacadePattern = /DB::(?:table|select|statement|raw)\s*\(/;
-    const relationTraversalPattern = /\$\w+->(?!\s*with\s*\()([a-zA-Z_]+)\s*(?:->|\[)/;
+    // Relation traversal: $model->relationship-> or $model->relationship[
+    // Exclude $this-> (class properties, not Eloquent relations) and
+    // $request/$response/$ (framework objects, not models).
+    const relationTraversalPattern =
+      /\$(?!this\b|request\b|response\b|e\b|exception\b)\w+->(?!\s*with\s*\()([a-zA-Z_]+)\s*(?:->|\[)/;
+
+    // Lines where a query method is chained on an already-materialised result —
+    // not a real DB hit.  e.g. factory()->create()->first(), collect([])->first()
+    const materializedChainPattern =
+      /(?:factory\s*\(|->create\s*\(|->make\s*\(|->createMany\s*\(|->makeMany\s*\(|collect\s*\().*->(?:first|get|count|pluck)\s*\(/;
 
     const evidence: EvidenceItem[] = [];
     let weightedHits = 0;
@@ -67,9 +79,10 @@ export const nPlusOneCheck: Check = {
         const windowSafe = safeLines.slice(i + 1, i + 11);
         for (let j = 0; j < windowSafe.length; j++) {
           if (
-            queryPattern.test(windowSafe[j]) ||
-            dbFacadePattern.test(windowSafe[j]) ||
-            relationTraversalPattern.test(windowSafe[j])
+            (queryPattern.test(windowSafe[j]) ||
+              dbFacadePattern.test(windowSafe[j]) ||
+              relationTraversalPattern.test(windowSafe[j])) &&
+            !materializedChainPattern.test(windowSafe[j])
           ) {
             weightedHits += weight;
             evidence.push({

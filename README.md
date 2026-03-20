@@ -183,20 +183,21 @@ Commit `.racoon-baseline.json` to track score trends over time, or add it to `.g
 
 ## Checks reference
 
-### PHP / Laravel (24 checks)
+### PHP / Laravel (25 checks)
 
 | Dimension | Check ID | What it looks for |
 |-----------|----------|-------------------|
 | Readability | `php-laravel/method-length` | Methods exceeding 30 lines |
 | Readability | `php-laravel/naming-conventions` | PascalCase classes, camelCase methods |
-| Maintainability | `php-laravel/controller-bloat` | Controllers exceeding 200 lines |
+| Maintainability | `php-laravel/controller-bloat` | Controller methods exceeding 30 code lines (comments/annotations stripped) — signals business logic in controller layer |
 | Maintainability | `php-laravel/service-layer` | Service classes relative to controllers |
 | Maintainability | `php-laravel/cyclomatic-complexity` | Decision points per function (proxy) |
 | Extensibility | `php-laravel/interface-usage` | Interface / contract definitions |
 | Extensibility | `php-laravel/repository-pattern` | Repository classes |
 | Extensibility | `php-laravel/config-usage` | Hard-coded URLs and IPs outside `config/` |
 | Test Coverage | `php-laravel/test-framework` | PHPUnit or Pest presence |
-| Test Coverage | `php-laravel/test-file-ratio` | Test files vs source files ratio |
+| Test Coverage | `php-laravel/test-file-ratio` | Critical-path files (controllers, services, jobs, etc.) with a corresponding test |
+| Test Coverage | `php-laravel/assertion-density` | Average assertions per test file — flags placeholder/smoke tests |
 | Test Coverage | `php-laravel/test-type-balance` | Feature vs Unit test mix |
 | Security | `php-laravel/hardcoded-secrets` | Password/key/token literals in source |
 | Security | `php-laravel/sql-injection` | Raw SQL with variable interpolation |
@@ -212,7 +213,7 @@ Commit `.racoon-baseline.json` to track score trends over time, or add it to `.g
 | Architecture | `php-laravel/middleware-usage` | Middleware classes and route usage |
 | Architecture | `php-laravel/separation-of-concerns` | Direct DB call density in controllers |
 
-### Next.js / React (23 checks)
+### Next.js / React (25 checks)
 
 | Dimension | Check ID | What it looks for |
 |-----------|----------|-------------------|
@@ -225,7 +226,8 @@ Commit `.racoon-baseline.json` to track score trends over time, or add it to `.g
 | Extensibility | `nextjs-react/env-var-usage` | `.env.example`, `.gitignore` coverage |
 | Extensibility | `nextjs-react/api-abstraction` | API layer files vs raw fetch in components |
 | Test Coverage | `nextjs-react/test-framework` | Jest/Vitest/Cypress/Playwright presence |
-| Test Coverage | `nextjs-react/test-file-ratio` | Test files vs source files ratio |
+| Test Coverage | `nextjs-react/test-file-ratio` | Critical-path files (pages, app routes, components, hooks) with a corresponding test |
+| Test Coverage | `nextjs-react/assertion-density` | Average assertions per test file — flags placeholder/smoke tests |
 | Test Coverage | `nextjs-react/coverage-config` | Coverage script + threshold enforcement |
 | Security | `nextjs-react/xss-risk` | `dangerouslySetInnerHTML` usage |
 | Security | `nextjs-react/eval-usage` | `eval()` / `new Function()` calls |
