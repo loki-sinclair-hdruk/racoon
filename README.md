@@ -159,6 +159,28 @@ Place a `.racoon.json` file in the root of the project being scanned:
 
 ---
 
+## Baseline tracking
+
+After each scan, Racoon writes a `.racoon-baseline.json` snapshot to the scanned project root. On subsequent scans, it diffs the new results against this snapshot and appends a delta section to the report:
+
+```
+  Changes since last scan  (21/03/2026, 09:14:32)
+  Overall: 58 → 62  ▲ +4 pts
+
+  Improvements (2)
+  ▲ [Security]         Hardcoded Secrets           0 → 25  (+25)
+  ▲ [Test Coverage]    Test File Ratio             40 → 55  (+15)
+
+  Regressions (1)
+  ✖ [Performance]      Next.js Image Optimisation  80 → 20  (−60)
+```
+
+Changes smaller than ±3 points are treated as noise and suppressed.
+
+Commit `.racoon-baseline.json` to track score trends over time, or add it to `.gitignore` to keep it local.
+
+---
+
 ## Checks reference
 
 ### PHP / Laravel (24 checks)
