@@ -1,5 +1,5 @@
 {
-  "name": "racoon",
+  "name": "raccoon",
   "version": "0.1.0",
   "description": "Extensible codebase quality scanner — scores projects across 8 engineering dimensions",
   "main": "dist/cli/index.js",
